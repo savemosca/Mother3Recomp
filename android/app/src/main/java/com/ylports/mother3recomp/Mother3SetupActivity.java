@@ -1,7 +1,20 @@
 package com.ylports.mother3recomp;
 
 import android.app.AlertDialog;
+import android.content.Intent;
+import android.os.Bundle;
+import android.text.InputType;
+import android.view.View;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+import android.widget.Toast;
 
+import com.ylports.mother3recomp.cloud.CloudSaves;
+
+import org.gbarecomp.GbaGameActivity;
+import org.gbarecomp.GbaGameConfig;
 import org.gbarecomp.GbaSetupActivity;
 
 import java.io.File;
@@ -27,21 +40,71 @@ import java.util.Locale;
  * Also hosts the desktop launcher's MOTHER 3 settings (widescreen, in-game
  * button prompts, mods). They are stored in the same files the native side
  * reads on every platform: config.ini [Launcher] and mods/enabled.txt.
+ *
+ * Android extras: RetroAchievements login, cloud saves (RomM / Hoard), the
+ * audio choice (Enhanced / HQ / Original), integer scaling, and suspend state
+ * safety (backups before each game, a warning when the in-game save is old,
+ * restoring a backup).
  */
 public final class Mother3SetupActivity extends GbaSetupActivity {
     private static final int PICK_MOD = 2001;
     private static final long MAX_MOD_BYTES = 16L * 1024 * 1024;
     private static final String[] PROMPT_STYLES =
         {"Auto", "Xbox", "PlayStation", "Nintendo", "On-screen buttons"};
+    private static final String[] AUDIO_MODES = {"Enhanced", "HQ", "Original"};
     private android.widget.LinearLayout modList;
+    private GbaGameConfig gameConfig;
+    private CloudSaves cloudSaves;
+    private Button raButton;
+    private Button cloudButton;
+    private TextView saveWarning;
 
     @Override
     protected boolean supportsAutomaticLaunch() { return false; }
 
     @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        // Before the setup screen checks for the ROM and builds the options.
+        gameConfig = GbaGameConfig.load(this);
+        LegacyFiles.migrate(getFilesDir(), gameConfig.romFile);
+        ensureAudioChoice();
+        cloudSaves = new CloudSaves(this, gameConfig.romFile,
+            gameConfig.romSha1.length > 0 ? gameConfig.romSha1[0] : "",
+            this::refreshCloudButton);
+        super.onCreate(savedInstanceState);
+    }
+
+    @Override
     protected void onResume() {
         super.onResume();
+        refreshSaveWarning();
+        refreshRetroAchievementsButton();
+        refreshCloudButton();
         showNativeLogIfChanged();
+        // Only after a game started from PLAY (remembered across recreation).
+        cloudSaves.syncAfterPlay();
+    }
+
+    /** PLAY goes through here: sync the save first, then keep the suspend state safe. */
+    @Override
+    public void startActivity(Intent intent) {
+        if (intent.getComponent() == null
+                || !GbaGameActivity.class.getName().equals(intent.getComponent().getClassName())) {
+            super.startActivity(intent);
+            return;
+        }
+        cloudSaves.syncBeforePlay(() -> {
+            // A sync can outlive this screen; a newer one handles PLAY then.
+            if (isDestroyed()) return;
+            // The engine overwrites the last session's log and reports.
+            SessionArchive.archivePrevious(getFilesDir());
+            // After the sync: a download leaves the state on disk but no longer
+            // resumes it, and the game's next suspend overwrites it.
+            SuspendBackups.keep(getFilesDir(), gameConfig.romFile);
+            SuspendBackups.upgradeMarker(getFilesDir(), gameConfig.romFile);
+            cloudSaves.gameStarting();
+            Mother3SetupActivity.super.startActivity(intent);
+        });
     }
 
     private void showNativeLogIfChanged() {
@@ -84,13 +147,43 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
             setIniValue("Launcher", "m3_widescreen", checked ? "1" : "0"));
         preferences.addView(widescreen);
 
-        android.widget.Switch hqAudio = new android.widget.Switch(this);
-        hqAudio.setText("HQ audio (changes the game's RNG; off for speedruns)");
-        styleOption(hqAudio);
-        hqAudio.setChecked(!"0".equals(iniValue("Launcher", "m3_hq_audio")));
-        hqAudio.setOnCheckedChangeListener((view, checked) ->
-            setIniValue("Launcher", "m3_hq_audio", checked ? "1" : "0"));
-        preferences.addView(hqAudio);
+        android.widget.Switch integerScale = new android.widget.Switch(this);
+        integerScale.setText("Integer scaling (whole-pixel multiples, the sharpest picture)");
+        styleOption(integerScale);
+        integerScale.setChecked("1".equals(iniValue("Display", "integer_scale")));
+        integerScale.setOnCheckedChangeListener((view, checked) ->
+            setIniValue("Display", "integer_scale", checked ? "1" : "0"));
+        preferences.addView(integerScale);
+
+        Button audio = new Button(this);
+        audio.setAllCaps(false);
+        audio.setText("Audio: " + AUDIO_MODES[audioMode()]);
+        audio.setOnClickListener(view -> chooseAudio(audio));
+        preferences.addView(audio);
+
+        saveWarning = new TextView(this);
+        saveWarning.setTextColor(android.graphics.Color.rgb(255, 211, 78));
+        saveWarning.setTextSize(13);
+        preferences.addView(saveWarning);
+        refreshSaveWarning();
+
+        Button backups = new Button(this);
+        backups.setAllCaps(false);
+        backups.setText("Suspend backups");
+        backups.setOnClickListener(view -> showSuspendBackups());
+        preferences.addView(backups);
+
+        raButton = new Button(this);
+        raButton.setAllCaps(false);
+        raButton.setOnClickListener(view -> showRetroAchievementsDialog());
+        preferences.addView(raButton);
+        refreshRetroAchievementsButton();
+
+        cloudButton = new Button(this);
+        cloudButton.setAllCaps(false);
+        cloudButton.setOnClickListener(view -> cloudSaves.showSettings());
+        preferences.addView(cloudButton);
+        refreshCloudButton();
 
         android.widget.Button prompts = new android.widget.Button(this);
         int style = 0;
@@ -131,6 +224,261 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
         button.setText("Copy diagnostics");
         button.setOnClickListener(view -> copyDiagnostics());
         preferences.addView(button);
+    }
+
+    // ── Audio ─────────────────────────────────────────────────────────────
+
+    /**
+     * 0 = Enhanced (the engine's MP2K shadow mixer, config.ini [Audio]
+     * enhanced), 1 = HQ (the game's mixer patched into the ROM, [Launcher]
+     * m3_hq_audio), 2 = Original. The two are never on together: the shadow
+     * mixer models the stock driver, and HQ moves its buffers.
+     */
+    private int audioMode() {
+        if (!"0".equals(iniValue("Launcher", "m3_hq_audio"))) return 1;
+        return "1".equals(iniValue("Audio", "enhanced")) ? 0 : 2;
+    }
+
+    private void setAudioMode(int mode) {
+        setIniValue("Launcher", "m3_hq_audio", mode == 1 ? "1" : "0");
+        setIniValue("Audio", "enhanced", mode == 0 ? "1" : "0");
+    }
+
+    /**
+     * Android defaults to Enhanced audio until the player picks one. HQ off
+     * must be written explicitly (the native default is on), and a player's
+     * existing [Audio] enhanced choice is kept: an update from the RG556 fork
+     * keeps the stock ROM image, so its suspend state still resumes.
+     */
+    private void ensureAudioChoice() {
+        if (!iniValue("Launcher", "m3_hq_audio").isEmpty()) return;
+        setIniValue("Launcher", "m3_hq_audio", "0");
+        if (iniValue("Audio", "enhanced").isEmpty()) setIniValue("Audio", "enhanced", "1");
+    }
+
+    private void chooseAudio(Button button) {
+        final int current = audioMode();
+        new AlertDialog.Builder(this)
+            .setTitle("Audio")
+            .setSingleChoiceItems(new String[] {
+                    "Enhanced: high-precision mix of the original music, without the 8-bit hiss",
+                    "HQ: the game's own mixer patched to high quality (changes the game's RNG)",
+                    "Original: the GBA's sound as it was"},
+                current, (dialog, which) -> {
+                    dialog.dismiss();
+                    if (which == current) return;
+                    Runnable apply = () -> {
+                        setAudioMode(which);
+                        button.setText("Audio: " + AUDIO_MODES[which]);
+                    };
+                    // HQ patches the ROM image, so a suspend state made with it
+                    // on cannot resume with it off, and the other way round.
+                    boolean romChanges = (current == 1) != (which == 1);
+                    if (!romChanges || !new File(getFilesDir(), "roms/" + stem() + ".suspend.pending").isFile()) {
+                        apply.run();
+                        return;
+                    }
+                    new AlertDialog.Builder(this)
+                        .setTitle("Switch HQ audio?")
+                        .setMessage("HQ audio changes the game image, so your suspended game can't be "
+                            + "resumed after this switch: the game starts from your in-game save. "
+                            + "A copy of the suspend state is kept in Suspend backups; switch back "
+                            + "and restore it to continue from there.")
+                        .setPositiveButton("Switch", (d, w) -> {
+                            SuspendBackups.keep(getFilesDir(), gameConfig.romFile);
+                            apply.run();
+                        })
+                        .setNegativeButton("Cancel", null)
+                        .show();
+                })
+            .setNegativeButton("Cancel", null)
+            .show();
+    }
+
+    private String stem() {
+        String name = gameConfig.romFile;
+        int dot = name.lastIndexOf('.');
+        return dot >= 0 ? name.substring(0, dot) : name;
+    }
+
+    // ── Suspend state safety ──────────────────────────────────────────────
+
+    private void refreshSaveWarning() {
+        if (saveWarning == null) return;
+        int days = SuspendBackups.saveLagDays(getFilesDir(), gameConfig.romFile);
+        if (days == 0) {
+            saveWarning.setVisibility(View.GONE);
+            return;
+        }
+        saveWarning.setText((days == SuspendBackups.NO_SAVE
+                ? "No in-game save yet."
+                : "Your in-game save is " + days + (days == 1 ? " day" : " days")
+                    + " older than where you left off.")
+            + "\nSave in the game: progress since then lives only in the suspend state.");
+        saveWarning.setVisibility(View.VISIBLE);
+    }
+
+    /** Lists the suspend-state backups and puts one back for the next PLAY. */
+    private void showSuspendBackups() {
+        if (org.libsdl.app.SdlSession.nativeRunning()) {
+            // It would write its own state over the restored one when it suspends.
+            Toast.makeText(this, "The game is still closing. Try again in a moment.",
+                Toast.LENGTH_SHORT).show();
+            return;
+        }
+        File[] backups = SuspendBackups.list(getFilesDir(), gameConfig.romFile);
+        if (backups.length == 0) {
+            new AlertDialog.Builder(this)
+                .setTitle("Suspend backups")
+                .setMessage("No backups yet. One is made each time PLAY resumes a suspended game.")
+                .setPositiveButton("OK", null)
+                .show();
+            return;
+        }
+        String[] labels = new String[backups.length];
+        for (int i = 0; i < backups.length; ++i) labels[i] = backupLabel(backups[i]);
+        new AlertDialog.Builder(this)
+            .setTitle("Resume from an earlier point")
+            .setItems(labels, (dialog, which) -> confirmRestore(backups[which], labels[which]))
+            .setNegativeButton("Cancel", null)
+            .show();
+    }
+
+    private void confirmRestore(File backup, String label) {
+        new AlertDialog.Builder(this)
+            .setTitle("Resume from " + label + "?")
+            .setMessage("PLAY will continue from this point. Where you are now is backed up "
+                + "first, so you can come back to it from this list.")
+            .setPositiveButton("Restore", (dialog, which) -> {
+                try {
+                    SuspendBackups.restore(getFilesDir(), gameConfig.romFile, backup);
+                    Toast.makeText(this, "Restored. PLAY resumes from " + label + ".",
+                        Toast.LENGTH_LONG).show();
+                } catch (IOException e) {
+                    Toast.makeText(this, "Restore failed: " + e.getMessage(),
+                        Toast.LENGTH_LONG).show();
+                }
+                refreshSaveWarning();
+            })
+            .setNegativeButton("Cancel", null)
+            .show();
+    }
+
+    /** "25 Oct 2026, 19:45" from mother3_en_v13.20261025-194529.state. */
+    private static String backupLabel(File backup) {
+        String name = backup.getName();
+        String[] parts = name.split("\\.");
+        if (parts.length >= 3) {
+            try {
+                java.util.Date when = new java.text.SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US)
+                    .parse(parts[parts.length - 2]);
+                if (when != null) {
+                    return new java.text.SimpleDateFormat("d MMM yyyy, HH:mm", Locale.US).format(when);
+                }
+            } catch (java.text.ParseException ignored) {
+                // fall back to the file name
+            }
+        }
+        return name;
+    }
+
+    // ── RetroAchievements and cloud saves ─────────────────────────────────
+
+    private void refreshCloudButton() {
+        if (cloudButton != null) cloudButton.setText(cloudSaves.buttonLabel());
+    }
+
+    private void refreshRetroAchievementsButton() {
+        if (raButton == null) return;
+        String user = RaBridge.savedUser(getFilesDir());
+        raButton.setText(user != null
+            ? "RetroAchievements: " + user
+            : "RetroAchievements: log in");
+    }
+
+    private void showRetroAchievementsDialog() {
+        String user = RaBridge.savedUser(getFilesDir());
+        if (user != null) {
+            new AlertDialog.Builder(this)
+                .setTitle("RetroAchievements")
+                .setMessage("Logged in as " + user + ".\n\n"
+                    + "Achievements unlock in softcore mode: RetroAchievements "
+                    + "accepts hardcore unlocks only from approved emulators.")
+                .setPositiveButton("OK", null)
+                .setNegativeButton("Log out", (dialog, which) -> {
+                    RaBridge.logout(getFilesDir());
+                    refreshRetroAchievementsButton();
+                })
+                .show();
+            return;
+        }
+
+        int pad = Math.round(16 * getResources().getDisplayMetrics().density);
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(pad, pad / 2, pad, 0);
+        EditText userField = new EditText(this);
+        userField.setHint("Username");
+        userField.setSingleLine(true);
+        userField.setInputType(InputType.TYPE_CLASS_TEXT
+            | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        EditText passwordField = new EditText(this);
+        passwordField.setHint("Password");
+        passwordField.setSingleLine(true);
+        passwordField.setInputType(InputType.TYPE_CLASS_TEXT
+            | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        TextView status = new TextView(this);
+        status.setText("Softcore mode. The password is used once to obtain a "
+            + "token and is not stored.");
+        form.addView(userField);
+        form.addView(passwordField);
+        form.addView(status);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+            .setTitle("RetroAchievements")
+            .setView(form)
+            .setPositiveButton("Log in", null)
+            .setNegativeButton("Cancel", null)
+            .create();
+        dialog.setOnShowListener(shown -> {
+            Button login = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+            login.setOnClickListener(view -> {
+                String name = userField.getText().toString().trim();
+                String password = passwordField.getText().toString();
+                if (name.isEmpty() || password.isEmpty()) {
+                    status.setText("Enter username and password.");
+                    return;
+                }
+                login.setEnabled(false);
+                status.setText("Logging in…");
+                new Thread(() -> {
+                    String error = null;
+                    String loggedIn = null;
+                    try {
+                        String[] credentials = RaBridge.login(name, password);
+                        RaBridge.saveCredentials(getFilesDir(), credentials[0], credentials[1]);
+                        loggedIn = credentials[0];
+                    } catch (IOException | RuntimeException failure) {
+                        error = CloudSaves.describe(failure);
+                    }
+                    final String message = error;
+                    final String account = loggedIn;
+                    runOnUiThread(() -> {
+                        if (isFinishing() || isDestroyed()) return;
+                        if (message == null) {
+                            dialog.dismiss();
+                            refreshRetroAchievementsButton();
+                            Toast.makeText(this, "RetroAchievements: logged in as " + account,
+                                Toast.LENGTH_SHORT).show();
+                        } else {
+                            status.setText(message);
+                            login.setEnabled(true);
+                        }
+                    });
+                }, "ra-login").start();
+            });
+        });
+        dialog.show();
     }
 
     private void styleOption(android.widget.CompoundButton option) {
