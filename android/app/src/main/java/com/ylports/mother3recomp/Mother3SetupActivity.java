@@ -205,6 +205,7 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
         menu.setOrientation(LinearLayout.VERTICAL);
         menu.setBackground(rounded(SURFACE, OUTLINE, 8));
         menu.setPadding(dp(10), dp(10), dp(10), dp(10));
+        menuItems.clear();
         View primary = menuItem(suspended ? "Continue" : "Play", this::play);
         menu.addView(primary);
         menu.addView(menuItem("Saves", () -> showPage(Page.SAVES)));
@@ -220,6 +221,7 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
         footer.addView(text("Unofficial fan project. Not affiliated with Nintendo.", 13, TEXT_MUTED));
         root.addView(footer);
 
+        pointAt(primary);  // before any focus: Android starts in touch mode
         primary.post(primary::requestFocus);
         return root;
     }
@@ -282,9 +284,12 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
         return box;
     }
 
+    private final List<TextView> menuItems = new ArrayList<>();
+
     /** One line of the menu card: the ▶ cursor marks the focused one, as in the game. */
     private View menuItem(String label, Runnable onPick) {
-        TextView item = text("      " + label, 20, INK);
+        TextView item = text(label, 20, INK);
+        item.setTag(label);
         item.setTypeface(bold());
         item.setFocusable(true);
         item.setClickable(true);
@@ -294,9 +299,17 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
         states.addState(new int[] {android.R.attr.state_focused}, rounded(SURFACE_FOCUSED, Color.TRANSPARENT, 6));
         states.addState(new int[] {}, rounded(Color.TRANSPARENT, Color.TRANSPARENT, 6));
         item.setBackground(states);
-        item.setOnFocusChangeListener((view, focused) -> item.setText((focused ? "▶   " : "      ") + label));
+        item.setOnFocusChangeListener((view, focused) -> { if (focused) pointAt(item); });
         item.setOnClickListener(view -> onPick.run());
+        menuItems.add(item);
+        pointAt(null);
         return item;
+    }
+
+    /** Puts the ▶ cursor on one menu line (none: null) and clears the others. */
+    private void pointAt(View target) {
+        for (TextView item : menuItems)
+            item.setText((item == target ? "▶   " : "      ") + item.getTag());
     }
 
     private View buildSettings() {
