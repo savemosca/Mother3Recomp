@@ -232,7 +232,7 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
 
         body.addView(section("Display"));
         body.addView(toggle("Widescreen (16:9)",
-            "Shows more of the field and battles. Applies when the game starts.",
+            "Fills the 16:9 screen with more of the field and battles. Applies when the game starts.",
             "1".equals(iniValue("Launcher", "m3_widescreen")),
             on -> setIniValue("Launcher", "m3_widescreen", on ? "1" : "0")));
         body.addView(toggle("Integer scaling",
