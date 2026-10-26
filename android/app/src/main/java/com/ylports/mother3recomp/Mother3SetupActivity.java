@@ -47,8 +47,10 @@ import java.util.function.Consumer;
  *
  * The engine's setup screen asks for the ROM and BIOS the first time. Once
  * they are in place this replaces it with three screens:
- * - Home: Continue / Play, when the game was suspended, and a warning when
- *   the in-game save is much older than the suspended game.
+ * - Home: a card like the game's file select (room, leader, party, play
+ *   time; see GameCard), a warning when the in-game save is much older than
+ *   the suspended game, and a menu: Continue / Play, Saves, Achievements,
+ *   Settings.
  * - Settings: display, audio, controls, mods, game files, help.
  * - Saves: the in-game save, the suspended game and its backups, cloud saves.
  * RetroAchievements opens a dialog from Home.
@@ -63,16 +65,20 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
     private static final String[] PROMPT_STYLES =
         {"Auto", "Xbox", "PlayStation", "Nintendo", "On-screen buttons"};
 
-    private static final int BACKGROUND = Color.rgb(9, 11, 24);
-    private static final int SURFACE = Color.rgb(20, 25, 48);
-    private static final int OUTLINE = Color.rgb(48, 58, 92);
-    private static final int ACCENT = Color.rgb(78, 216, 255);
-    private static final int FOCUS = Color.rgb(255, 211, 78);
+    // After the game's own file select (its colours and shapes, none of its
+    // art): beige cards with a white rim on black, dark text, a ▶ cursor.
+    private static final int BACKGROUND = Color.BLACK;
+    private static final int SURFACE = Color.rgb(231, 214, 206);
+    private static final int SURFACE_FOCUSED = Color.rgb(214, 193, 182);
+    private static final int OUTLINE = Color.WHITE;
+    private static final int ACCENT = Color.rgb(248, 216, 0);
+    private static final int FOCUS = Color.rgb(248, 216, 0);
     private static final int WARNING = Color.rgb(255, 211, 78);
-    private static final int TEXT = Color.WHITE;
-    private static final int TEXT_SECONDARY = Color.rgb(177, 187, 216);
-    private static final int TEXT_MUTED = Color.rgb(132, 143, 173);
-    private static final int OK_GREEN = Color.rgb(120, 235, 171);
+    private static final int TEXT = Color.WHITE;            // on the black background
+    private static final int TEXT_SECONDARY = Color.rgb(214, 214, 214);
+    private static final int TEXT_MUTED = Color.rgb(150, 150, 150);
+    private static final int INK = Color.rgb(33, 33, 33);   // on cards
+    private static final int INK_MUTED = Color.rgb(104, 92, 86);
 
     private enum Page { HOME, SETTINGS, SAVES }
 
@@ -172,59 +178,125 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
 
     private View buildHome() {
         LinearLayout root = column();
-        root.setPadding(dp(48), dp(28), dp(48), dp(20));
+        root.setPadding(dp(48), dp(24), dp(48), dp(14));
 
         LinearLayout header = new LinearLayout(this);
         header.setGravity(Gravity.CENTER_VERTICAL);
-        TextView title = text(gameConfig.title, 28, TEXT);
-        title.setTypeface(Typeface.DEFAULT_BOLD);
+        TextView title = text(gameConfig.title, 26, TEXT);
+        title.setTypeface(bold());
         header.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
         String user = RaBridge.savedUser(getFilesDir());
-        TextView account = text(user != null ? "RetroAchievements · " + user : "", 13, TEXT_MUTED);
-        header.addView(account);
+        header.addView(text(user != null ? "RetroAchievements · " + user : "", 14, TEXT_MUTED));
         root.addView(header);
 
-        LinearLayout center = column();
-        center.setGravity(Gravity.CENTER);
         boolean suspended = suspendMarker().isFile() && suspendState().isFile();
-        Button primary = button((suspended ? "▶   Continue" : "▶   Play"), true);
-        primary.setTextSize(22);
-        primary.setOnClickListener(view -> play());
-        center.addView(primary, size(dp(420), dp(76), 0, 0));
-        TextView caption = text(suspended
-                ? "Suspended " + when(suspendState().lastModified())
-                : saveFile().isFile() ? "Starts from your in-game save" : "New game",
-            15, TEXT_SECONDARY);
-        caption.setGravity(Gravity.CENTER);
-        center.addView(caption, size(-2, -2, dp(10), 0));
+        root.addView(fileCard(suspended), size(-1, -2, dp(16), 0));
+
         String warning = saveWarning();
         if (warning != null) {
             TextView banner = text("!   " + warning, 14, WARNING);
             // No border: a yellow border means "selected" everywhere else.
-            banner.setBackground(rounded(Color.argb(40, 255, 211, 78), Color.TRANSPARENT, 12));
-            banner.setPadding(dp(18), dp(12), dp(18), dp(12));
-            center.addView(banner, size(dp(620), -2, dp(22), 0));
+            banner.setBackground(rounded(Color.argb(40, 255, 211, 78), Color.TRANSPARENT, 8));
+            banner.setPadding(dp(18), dp(10), dp(18), dp(10));
+            root.addView(banner, size(-1, -2, dp(10), 0));
         }
+
+        LinearLayout menu = new LinearLayout(this);
+        menu.setOrientation(LinearLayout.VERTICAL);
+        menu.setBackground(rounded(SURFACE, OUTLINE, 8));
+        menu.setPadding(dp(10), dp(10), dp(10), dp(10));
+        View primary = menuItem(suspended ? "Continue" : "Play", this::play);
+        menu.addView(primary);
+        menu.addView(menuItem("Saves", () -> showPage(Page.SAVES)));
+        menu.addView(menuItem("Achievements", this::showRetroAchievementsDialog));
+        menu.addView(menuItem("Settings", () -> showPage(Page.SETTINGS)));
+        LinearLayout center = new LinearLayout(this);
+        center.setGravity(Gravity.CENTER);
+        center.addView(menu, new LinearLayout.LayoutParams(dp(360), -2));
         root.addView(center, new LinearLayout.LayoutParams(-1, 0, 1));
 
-        LinearLayout actions = new LinearLayout(this);
-        actions.setGravity(Gravity.CENTER);
-        Button settings = button("Settings", false);
-        settings.setOnClickListener(view -> showPage(Page.SETTINGS));
-        Button saves = button("Saves", false);
-        saves.setOnClickListener(view -> showPage(Page.SAVES));
-        Button achievements = button("Achievements", false);
-        achievements.setOnClickListener(view -> showRetroAchievementsDialog());
-        for (Button action : new Button[] {settings, saves, achievements})
-            actions.addView(action, size(dp(200), dp(54), 0, 0, dp(8), dp(8)));
-        root.addView(actions);
-
-        TextView hint = text("START  play", 12, TEXT_MUTED);
-        hint.setGravity(Gravity.CENTER);
-        root.addView(hint, size(-1, -2, dp(14), 0));
+        LinearLayout footer = new LinearLayout(this);
+        footer.addView(text("START  play", 13, TEXT_MUTED), new LinearLayout.LayoutParams(0, -2, 1));
+        footer.addView(text("Unofficial fan project. Not affiliated with Nintendo.", 13, TEXT_MUTED));
+        root.addView(footer);
 
         primary.post(primary::requestFocus);
         return root;
+    }
+
+    /**
+     * The game's file select, as text: where, who and how long, from the
+     * suspended game when Continue resumes one, else from the in-game save
+     * (its slot with the most play time).
+     */
+    private View fileCard(boolean suspended) {
+        File rom = new File(getFilesDir(), "roms/" + gameConfig.romFile);
+        GameCard card = suspended ? GameCard.fromSuspendState(suspendState(), rom) : null;
+        String when = suspended ? "Suspended " + when(suspendState().lastModified()) : null;
+        if (card == null && !suspended) {
+            for (int slot = 0; slot < 2; ++slot) {
+                GameCard saved = GameCard.fromSave(saveFile(), slot, rom);
+                if (saved != null && (card == null || saved.playFrames > card.playFrames)) card = saved;
+            }
+            if (card != null) when = "Saved " + when(saveFile().lastModified());
+        }
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setBackground(rounded(SURFACE, OUTLINE, 8));
+        box.setPadding(dp(24), dp(14), dp(24), dp(14));
+        if (card == null) {
+            TextView empty = text(suspended ? "Suspended game" : saveFile().isFile() ? "In-game save" : "New game",
+                20, INK);
+            empty.setTypeface(bold());
+            box.addView(empty);
+            if (when != null) box.addView(text(when, 14, INK_MUTED));
+            return box;
+        }
+
+        LinearLayout top = new LinearLayout(this);
+        TextView who = text(card.leader + "    Lv " + card.level, 20, INK);
+        who.setTypeface(bold());
+        top.addView(who, new LinearLayout.LayoutParams(0, -2, 1));
+        if (card.place != null) {
+            TextView place = text(card.place, 20, INK);
+            place.setTypeface(bold());
+            top.addView(place);
+        }
+        box.addView(top);
+
+        LinearLayout middle = new LinearLayout(this);
+        middle.setGravity(Gravity.CENTER_VERTICAL);
+        String with = card.companions.isEmpty() ? "" : "with " + String.join(", ", card.companions);
+        middle.addView(text(with, 15, INK_MUTED), new LinearLayout.LayoutParams(0, -2, 1));
+        TextView label = text("TIME  ", 15, ACCENT);
+        label.setTypeface(bold());
+        label.setShadowLayer(1, dp(1), dp(1), INK);
+        middle.addView(label);
+        TextView time = text(card.playTime(), 18, INK);
+        time.setTypeface(bold());
+        middle.addView(time);
+        box.addView(middle, size(-1, -2, dp(4), 0));
+
+        if (when != null) box.addView(text(when, 14, INK_MUTED), size(-1, -2, dp(6), 0));
+        return box;
+    }
+
+    /** One line of the menu card: the ▶ cursor marks the focused one, as in the game. */
+    private View menuItem(String label, Runnable onPick) {
+        TextView item = text("      " + label, 20, INK);
+        item.setTypeface(bold());
+        item.setFocusable(true);
+        item.setClickable(true);
+        item.setPadding(dp(14), dp(8), dp(14), dp(8));
+        StateListDrawable states = new StateListDrawable();
+        states.addState(new int[] {android.R.attr.state_pressed}, rounded(SURFACE_FOCUSED, Color.TRANSPARENT, 6));
+        states.addState(new int[] {android.R.attr.state_focused}, rounded(SURFACE_FOCUSED, Color.TRANSPARENT, 6));
+        states.addState(new int[] {}, rounded(Color.TRANSPARENT, Color.TRANSPARENT, 6));
+        item.setBackground(states);
+        item.setOnFocusChangeListener((view, focused) -> item.setText((focused ? "▶   " : "      ") + label));
+        item.setOnClickListener(view -> onPick.run());
+        return item;
     }
 
     private View buildSettings() {
@@ -339,7 +411,7 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
         back.setOnClickListener(view -> showPage(Page.HOME));
         header.addView(back, size(dp(140), dp(48), 0, 0, 0, dp(24)));
         TextView heading = text(title, 24, TEXT);
-        heading.setTypeface(Typeface.DEFAULT_BOLD);
+        heading.setTypeface(bold());
         header.addView(heading);
         root.addView(header);
 
@@ -360,8 +432,8 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
     }
 
     private TextView section(String title) {
-        TextView view = text(title.toUpperCase(Locale.US), 12, ACCENT);
-        view.setTypeface(Typeface.DEFAULT_BOLD);
+        TextView view = text(title.toUpperCase(Locale.US), 13, ACCENT);
+        view.setTypeface(bold());
         view.setLetterSpacing(0.14f);
         view.setPadding(0, dp(22), 0, dp(6));
         return view;
@@ -391,7 +463,7 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
     /** A focusable row in a single-choice group. */
     private View choice(String title, String detail, boolean selected, Runnable onPick) {
         LinearLayout row = row(title, detail);
-        TextView mark = text(selected ? "●" : "○", 26, selected ? ACCENT : TEXT_MUTED);
+        TextView mark = text(selected ? "●" : "○", 26, selected ? INK : INK_MUTED);
         row.addView(mark);
         row.setOnClickListener(view -> onPick.run());
         return row;
@@ -400,7 +472,7 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
     /** A focusable row that cycles a value. */
     private View value(String title, String detail, String current, Runnable onNext) {
         LinearLayout row = row(title, detail);
-        TextView shown = text(current + "  ›", 15, ACCENT);
+        TextView shown = text(current + "  ›", 15, INK);
         row.addView(shown);
         row.setOnClickListener(view -> onNext.run());
         return row;
@@ -415,9 +487,9 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
         row.setPadding(dp(18), dp(10), dp(18), dp(10));
         LinearLayout texts = new LinearLayout(this);
         texts.setOrientation(LinearLayout.VERTICAL);
-        TextView name = text(title, 16, TEXT);
+        TextView name = text(title, 16, INK);
         texts.addView(name);
-        if (detail != null && !detail.isEmpty()) texts.addView(text(detail, 13, TEXT_MUTED));
+        if (detail != null && !detail.isEmpty()) texts.addView(text(detail, 13, INK_MUTED));
         row.addView(texts, new LinearLayout.LayoutParams(0, -2, 1));
         row.setLayoutParams(size(-1, -2, dp(4), 0));
         return row;
@@ -427,20 +499,20 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
         Button button = new Button(this);
         button.setText(label);
         button.setAllCaps(false);
-        button.setTypeface(Typeface.DEFAULT_BOLD);
+        button.setTypeface(bold());
         button.setTextSize(primary ? 18 : 15);
-        button.setTextColor(primary ? Color.rgb(8, 16, 27) : TEXT);
+        button.setTextColor(INK);
         button.setFocusable(true);
-        button.setBackground(states(primary ? ACCENT : SURFACE, primary ? Color.TRANSPARENT : OUTLINE));
+        button.setBackground(states(SURFACE, OUTLINE));
         return button;
     }
 
     /** Background with a visible focus border: the platform highlight is hidden by custom fills. */
     private Drawable states(int fill, int edge) {
         StateListDrawable states = new StateListDrawable();
-        states.addState(new int[] {android.R.attr.state_pressed}, rounded(fill, FOCUS, 14));
-        states.addState(new int[] {android.R.attr.state_focused}, rounded(fill, FOCUS, 14));
-        states.addState(new int[] {}, rounded(fill, edge, 14));
+        states.addState(new int[] {android.R.attr.state_pressed}, rounded(fill, FOCUS, 8));
+        states.addState(new int[] {android.R.attr.state_focused}, rounded(fill, FOCUS, 8));
+        states.addState(new int[] {}, rounded(fill, edge, 8));
         return states;
     }
 
@@ -452,8 +524,29 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
         return shape;
     }
 
+    private Typeface font;
+
+    /** Pixelify Sans (SIL Open Font License, res/raw/pixelify_sans_ofl.txt). */
+    private Typeface font() {
+        if (font == null) {
+            // By name: the resource package follows the application id.
+            int id = getResources().getIdentifier("pixelify_sans", "font", getPackageName());
+            try {
+                font = id != 0 ? getResources().getFont(id) : Typeface.DEFAULT;
+            } catch (RuntimeException missing) {
+                font = Typeface.DEFAULT;
+            }
+        }
+        return font;
+    }
+
+    private Typeface bold() {
+        return Typeface.create(font(), 600, false);
+    }
+
     private TextView text(String value, float size, int color) {
         TextView view = new TextView(this);
+        view.setTypeface(font());
         view.setText(value);
         view.setTextSize(size);
         view.setTextColor(color);
