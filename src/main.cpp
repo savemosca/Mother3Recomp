@@ -226,6 +226,7 @@ int mother3_main(int argc, char** argv) {
     opts.freely_resizable_window = true;
     opts.max_view_width = 284;  // ceiling only; --view-width (launcher setting) picks the width
     opts.view_geometry = &mother3_view_geometry;
+    opts.runtime_ui_theme = "mother3";  // the runtime menu after the game's own windows
 
     std::vector<std::string> args(argv, argv + argc);
 #if defined(__ANDROID__)
@@ -248,6 +249,8 @@ int mother3_main(int argc, char** argv) {
     // sound on devices that deny the low-latency path; SDL's Java AudioTrack driver blocks instead.
     SDL_SetHint(SDL_HINT_AUDIODRIVER, "android");
     opts.touch_pad_default = 1;
+    // The launcher's pixel font (SIL OFL), read from the APK's assets.
+    opts.runtime_ui_font = "payload/fonts/pixelify_sans.ttf";
     // shortcut: rewind/fast-forward stay desktop-only until rewind memory is measured on phones.
     opts.expose_assist_tools = false;
     opts.assist_tools_enabled_by_default = false;

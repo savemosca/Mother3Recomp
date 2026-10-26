@@ -3,7 +3,7 @@
     "url": "https://github.com/mstan/gbarecomp.git",
     "revision": "e353848ca8e82e7860469a235784a000102e7781",
     "patch": "patches/gbarecomp-runtime.patch",
-    "sha256": "37798626c8750cd7622cfe9f1d844126e25c6268c5111d150a0785ae0136c105",
+    "sha256": "567ee87e4ec12706a40205e489de7ee0ed5f1ea7191d59d7cc904cc4ae01fb0d",
     "submodules": {
       "external/arm-recomp-core": {
         "url": "https://github.com/mstan/arm-recomp-core.git",
@@ -19,7 +19,7 @@
     "url": "https://github.com/mstan/recomp-ui.git",
     "revision": "41c88ffea852b970af8d50312620b17404e455ad",
     "patch": "patches/recomp-ui-runtime.patch",
-    "sha256": "671c2c049b5162a2fb63aa15359ad7dfadb028c1cb74f0e6d29a8fc78365718d"
+    "sha256": "001c6608a19486195ccced52b78e79c795192de6c8b8e595fec8548562534181"
   },
   "third_party/rcheevos": {
     "url": "https://github.com/RetroAchievements/rcheevos.git",
