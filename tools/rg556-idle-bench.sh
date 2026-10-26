@@ -54,12 +54,14 @@ adb shell su -c "'set -e; mkdir -p $D/roms; rm -f $D/roms/$STEM.suspend.* $D/and
 adb shell svc power stayon usb
 adb shell am start -n "$PKG/com.ylports.mother3recomp.Mother3SetupActivity" >/dev/null
 sleep 3
-if ! tap_button PLAY; then
-  echo "PLAY not found on the setup screen (ROM or BIOS missing?)" >&2
-  adb shell am force-stop "$PKG"; adb shell svc power stayon false; exit 1
-fi
+# START plays from the home screen; setup pages without it get PLAY tapped.
+adb shell input keyevent BUTTON_START
 for ((i = 0; ; i++)); do
   adb shell su -c "'grep -q suspend_resumed $D/android-runtime.log 2>/dev/null'" && break
+  if ((i == 8)) && ! tap_button PLAY; then
+    echo "neither START nor PLAY started the game (ROM or BIOS missing?)" >&2
+    adb shell am force-stop "$PKG"; adb shell svc power stayon false; exit 1
+  fi
   if ((i >= 60)); then
     echo "the game did not resume within 60 s" >&2
     adb shell am force-stop "$PKG"; adb shell svc power stayon false; exit 1
