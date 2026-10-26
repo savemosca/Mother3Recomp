@@ -153,7 +153,7 @@ bool void_cell(const Field& f, int cx, int cy) {
 // asks about the same few cells for every margin pixel of every layer. A 32x32
 // direct-mapped window covers the screen plus margins without collisions.
 std::uint32_t g_field_gen = 0;  // bumped by tick() whenever it replaces g
-std::uint32_t g_frame = 0;      // bumped by tick() at every vblank of a widened view
+std::uint32_t g_frame = 0;      // bumped by frame_start() as each widened frame renders
 bool void_cell_live(int cx, int cy) {
     struct Slot { int cx, cy; std::uint64_t frame; std::uint32_t gen; bool is_void; };
     static Slot s_slot[32 * 32];
@@ -270,47 +270,28 @@ bool hidden_outside_windows(const std::uint8_t* r, int layer_bit) {
     return (io16(r, 0) & 0x6000) && !(io16(r, 0x4A) & layer_bit);
 }
 
-// The same above and below the screen, but only where the map's own top or
-// bottom edge cuts a picture that reaches the native screen's edge row. A room
-// that ends on screen (dark floor below it) is the game's own picture, not a
-// shove, and keeps the rows the other margin shows of it. tick() reads the
-// last frame's edge rows into g_edge_open (top, bottom).
-bool g_edge_open[2] = {true, true};
-
-int black_height(int cy) {
-    int top = std::clamp(g_margin_top - cy, 0, g_margin_top);
-    int bottom = std::clamp(cy + 160 + g_margin_bottom - 16 * g.height, 0, g_margin_bottom);
-    if (!g_edge_open[0]) top = 0;
-    if (!g_edge_open[1]) bottom = 0;
-    return std::max(top, bottom);
-}
-
-bool in_black_rows(int cy, int y) {
-    if (y >= 0 && y < 160) return false;
-    const int b = black_height(cy);
-    return b && (y < -g_margin_top + b || y >= 160 + g_margin_bottom - b);
-}
-
 bool in_black(int cx, int cy, int hx, int y) {
     const int b = black_width(cx, cy, y);
-    return (b && (hx < -g_margin_left + b || hx >= 240 + g_margin_right - b)) || in_black_rows(cy, y);
+    return b && (hx < -g_margin_left + b || hx >= 240 + g_margin_right - b);
 }
 
-// A sprite's position and size in native-relative pixels. OAM Y is 8 bits:
-// rows just below the native screen (160 up to the bottom margin) are read as
-// below it, the rest of 160..255 as above it, as the hardware does.
+// A sprite's position and size in native-relative pixels. OAM X is 9 bits and
+// Y 8 bits, so the hardware reads X 256..511 and Y 160..255 as left of and
+// above the screen. The margins reach past those limits (X up to 319 when the
+// right margin is 80 wide), so a value is read as right of or below the
+// screen when that is where it lands in the view; both readings can't.
 bool obj_box(std::uint16_t attr0, std::uint16_t attr1, int* sx, int* sy, int* w, int* h) {
     static const int kW[3][4] = {{8, 16, 32, 64}, {16, 32, 32, 64}, {8, 8, 16, 32}};
     static const int kH[3][4] = {{8, 16, 32, 64}, {8, 8, 16, 32}, {16, 32, 32, 64}};
     const int shape = (attr0 >> 14) & 3, size = (attr1 >> 14) & 3;
     if (shape > 2) return false;
-    *sx = attr1 & 0x1FF;
-    *sy = attr0 & 0xFF;
-    if (*sx & 0x100) *sx -= 0x200;
-    if (*sy >= 160 + g_margin_bottom) *sy -= 256;
     const int doubled = (attr0 & 0x300) == 0x300 ? 2 : 1;  // affine double-size box
     *w = kW[shape][size] * doubled;
     *h = kH[shape][size] * doubled;
+    *sx = attr1 & 0x1FF;
+    *sy = attr0 & 0xFF;
+    if (*sx >= 256 && (*sx >= 240 + g_margin_right || *sx - 512 + *w > -g_margin_left)) *sx -= 512;
+    if (*sy >= 160 + g_margin_bottom) *sy -= 256;
     return true;
 }
 
@@ -333,9 +314,8 @@ int place_obj(int, std::uint16_t attr0, std::uint16_t attr1, std::uint16_t, int*
     if (!g.ok) return 0;
     int sx, sy, w, h;
     if (!obj_box(attr0, attr1, &sx, &sy, &w, &h)) return 0;
-    if (sx >= 0 && sx + w <= 240) return 0;  // within the native columns
-    if (obj_shows_in_margin(sx, sy, w, h)) return 0;
-    *out_sx = 100000;  // off every canvas
+    const bool native = sx >= 0 && sx + w <= 240;  // within the native columns
+    *out_sx = native || obj_shows_in_margin(sx, sy, w, h) ? sx : 100000;  // else off every canvas
     return 1;
 }
 
@@ -543,7 +523,6 @@ struct RowView {
     int y = 0;
     bool hidden[4] = {};                   // per BG, outside every window it shows in
     int black_left = 0, black_right = 0;   // margin columns the centring black covers
-    bool black_row = false;                // a margin row the centring black covers
     int room_cx[4] = {}, room_cy[4] = {};  // per BG, the camera its rooms are measured in
     int org_x[4] = {}, org_y[4] = {};      // per BG, the world position of its top-left
 };
@@ -579,7 +558,6 @@ int provide(int bg, int hx, int y, std::uint16_t* out) {
         for (int b = 0; b <= 3; ++b) s_row.hidden[b] = hidden_outside_windows(r, 1 << b);
         int cx, cy;
         camera(r, 2, &cx, &cy);
-        s_row.black_row = in_black_rows(cy, y);
         const int black = black_width(cx, cy, y);
         s_row.black_left = -g_margin_left + black;
         s_row.black_right = 240 + g_margin_right - black;
@@ -588,7 +566,7 @@ int provide(int bg, int hx, int y, std::uint16_t* out) {
             origin(g, r, b, &s_row.org_x[b], &s_row.org_y[b]);
         }
     }
-    if (s_row.hidden[bg] || s_row.black_row || hx < s_row.black_left || hx >= s_row.black_right)
+    if (s_row.hidden[bg] || hx < s_row.black_left || hx >= s_row.black_right)
         return gba::kWsTilemapUnavailable;
     // BG0 answers per side (and, above and below the screen, once for the rest).
     const int cell = bg == 0 ? (hx < 0 ? -1 : hx >= 240 ? -2 : -3) : (s_row.room_cx[bg] + hx) >> 4;
@@ -611,6 +589,8 @@ int provide(int bg, int hx, int y, std::uint16_t* out) {
     return m.action;
 }
 
+void frame_start();
+
 }  // namespace
 
 void install() {
@@ -619,9 +599,45 @@ void install() {
     gba::g_ws_obj_attr_y_provider = &place_obj_y;
     gba::g_ws_authored_margin_layers = 1;
     gba::g_ws_pillarbox = 1;  // until the field validates
+    gba::g_ws_frame_start = &frame_start;
 }
 
 namespace {
+// The game's camera stops at the map's edges with the native 240x160 inside the
+// map. The widened view stops there too: near an edge the native picture slides
+// towards it inside the canvas instead of the margins showing the void past the
+// map (which then took matching black on the other side, a black frame in the
+// corners). Looping maps, battles and other screens keep it centred.
+void place_native_view(gba::GbaPpu* ppu) {
+    const int spare_x = static_cast<int>(ppu->render_width()) - 240;
+    const int spare_y = static_cast<int>(ppu->render_height()) - 160;
+    int left = static_cast<int>(ppu->view_extra_left()), top = static_cast<int>(ppu->view_extra_top());
+    const std::uint8_t* r = io();
+    const bool placed = g.ok && r;
+    if (placed) {
+        int cx, cy;
+        camera(r, 2, &cx, &cy);
+        const int loops = ew8(kMapLoops), map_w = 16 * g.width, map_h = 16 * g.height;
+        if (!(loops & 0x20) && map_w >= 240 + spare_x) left = std::clamp(left, cx + 240 + spare_x - map_w, cx);
+        if (!(loops & 0x10) && map_h >= 160 + spare_y) top = std::clamp(top, cy + 160 + spare_y - map_h, cy);
+        left = std::clamp(left, 0, spare_x);
+        top = std::clamp(top, 0, spare_y);
+    }
+    gba::g_ws_native_view_left = placed ? left : -1;
+    gba::g_ws_native_view_top = placed ? top : -1;
+    g_margin_left = left;
+    g_margin_right = spare_x - left;
+    g_margin_top = top;
+    g_margin_bottom = spare_y - top;
+}
+
+// Each rendered frame: what it shows is settled by now (the game wrote its
+// scroll during vblank), so the placement matches the scroll it renders with.
+void frame_start() {
+    ++g_frame;
+    if (gba::GbaPpu* ppu = gbarecomp::active_ppu()) place_native_view(ppu);
+}
+
 void set_detached(Field& f) {
     f.detached = f.layer[0] && (f.loop_x || f.loop_y || f.lw != f.width || f.lh != f.height);
 }
@@ -636,21 +652,6 @@ void tick() {
     // Hooks start disabled and a launch disables them again; at 240px they stay off.
     for (const char* id : kCullHooks)
         if (!gba_mod_function_hook_enabled(id)) gba_mod_set_function_hook_enabled(id, 1);
-    g_margin_left = static_cast<int>(ppu->view_extra_left());
-    g_margin_right = static_cast<int>(ppu->render_width()) - 240 - g_margin_left;
-    ++g_frame;
-    g_margin_top = static_cast<int>(ppu->view_extra_top());
-    g_margin_bottom = static_cast<int>(ppu->view_extra_bottom());
-    if (g_margin_top || g_margin_bottom) {
-        const std::uint8_t* fb = ppu->has_latched_framebuffer() ? ppu->latched_framebuffer() : nullptr;
-        for (int i = 0; i < 2; ++i) {
-            if (!fb) { g_edge_open[i] = true; continue; }
-            const std::uint8_t* row = fb + 3u * ((g_margin_top + (i ? 159u : 0u)) * ppu->render_width() + g_margin_left);
-            int lit = 0;
-            for (int x = 0; x < 240; ++x) lit += row[3 * x] + row[3 * x + 1] + row[3 * x + 2] > 48;
-            g_edge_open[i] = 2 * lit > 240;
-        }
-    }
     const Uint32 now = SDL_GetTicks();
     if (now < g_next) return;
     g_next = now + 50;
