@@ -900,7 +900,7 @@ index 53ba221..73449b9 100644
          return static_cast<uint16_t>(host_keyinput_ & synth_keyinput_ & 0x03FFu);
      }
 diff --git a/src/gba/gba_ppu.cpp b/src/gba/gba_ppu.cpp
-index 0454527..5f9865d 100644
+index 0454527..bbfb3aa 100644
 --- a/src/gba/gba_ppu.cpp
 +++ b/src/gba/gba_ppu.cpp
 @@ -57,9 +57,23 @@ extern "C" int (*g_ws_obj_attr_y_provider)(int, std::uint16_t,
@@ -999,10 +999,29 @@ index 0454527..5f9865d 100644
          if (hd_line) {
              // The expanded compositor may apply optional presentation filters.
              // Keep its native scratch entirely separate from canonical pixels.
-@@ -2477,8 +2513,11 @@ void GbaPpu::render_scanline(uint32_t y,
+@@ -2466,21 +2502,28 @@ void GbaPpu::render_scanline(uint32_t y,
+         } else if (hd) hd->upscale_line(y, work_fb_.data() + y * render_width() * 3);
+         return;
+     }
+-    // Host-authored extra rows use this frame's published state once, at
+-    // scanline zero. They never run emulated scanline timing or affine updates.
+-    if (y == 0 && (extra_top_ || extra_bottom_)) {
+-        for (int sy = -static_cast<int>(extra_top_); sy < static_cast<int>(kScreenHeight + extra_bottom_); ++sy) {
+-            if (sy >= 0 && sy < static_cast<int>(kScreenHeight)) continue;
++    // Host-authored extra rows use the published state of the native edge row
++    // they continue: rows above at scanline zero, rows below after the last
++    // scanline, so per-line scroll effects carry on past both edges. They never
++    // run emulated scanline timing or affine updates.
++    auto render_extra_rows = [&](int from, int to) {
++        for (int sy = from; sy < to; ++sy) {
+             render_scanline_wide(work_fb_.data(), sy, dispcnt, io, vram, oam, pal,
+                                  render_width(), extra_left_, extra_top_);
+             if (hd) hd->upscale_line(unsigned(sy + int(extra_top_)),
                  work_fb_.data() + size_t(sy + int(extra_top_)) * render_width() * 3);
          }
-     }
+-    }
++    };
++    if (y == 0 && extra_top_) render_extra_rows(-static_cast<int>(extra_top_), 0);
 +    if (record)
 +        g_tag_row = work_tags_.data() + static_cast<std::size_t>(y + extra_top_) * render_width();
      render_scanline_wide(work_fb_.data(), y, dispcnt, affine_io.data(),
@@ -1010,8 +1029,12 @@ index 0454527..5f9865d 100644
 +    g_tag_row = nullptr;
      if (hd && !hd_line) hd->upscale_line(y + extra_top_,
          work_fb_.data() + size_t(y + extra_top_) * render_width() * 3);
++    if (y == kScreenHeight - 1 && extra_bottom_)
++        render_extra_rows(static_cast<int>(kScreenHeight), static_cast<int>(kScreenHeight + extra_bottom_));
  }
-@@ -2510,6 +2549,12 @@ void GbaPpu::latch_framebuffer(uint16_t dispcnt,
+ 
+ void GbaPpu::note_affine_reference_write(unsigned bg, bool y_axis) {
+@@ -2510,6 +2553,12 @@ void GbaPpu::latch_framebuffer(uint16_t dispcnt,
  void GbaPpu::mark_framebuffer_latched() {
      if (rasterization_enabled_)
          std::memcpy(latched_fb_.data(), work_fb_.data(), render_bytes());

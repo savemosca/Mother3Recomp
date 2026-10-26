@@ -270,9 +270,30 @@ bool hidden_outside_windows(const std::uint8_t* r, int layer_bit) {
     return (io16(r, 0) & 0x6000) && !(io16(r, 0x4A) & layer_bit);
 }
 
+// The same above and below the screen, but only where the map's own top or
+// bottom edge cuts a picture that reaches the native screen's edge row. A room
+// that ends on screen (dark floor below it) is the game's own picture, not a
+// shove, and keeps the rows the other margin shows of it. tick() reads the
+// last frame's edge rows into g_edge_open (top, bottom).
+bool g_edge_open[2] = {true, true};
+
+int black_height(int cy) {
+    int top = std::clamp(g_margin_top - cy, 0, g_margin_top);
+    int bottom = std::clamp(cy + 160 + g_margin_bottom - 16 * g.height, 0, g_margin_bottom);
+    if (!g_edge_open[0]) top = 0;
+    if (!g_edge_open[1]) bottom = 0;
+    return std::max(top, bottom);
+}
+
+bool in_black_rows(int cy, int y) {
+    if (y >= 0 && y < 160) return false;
+    const int b = black_height(cy);
+    return b && (y < -g_margin_top + b || y >= 160 + g_margin_bottom - b);
+}
+
 bool in_black(int cx, int cy, int hx, int y) {
     const int b = black_width(cx, cy, y);
-    return b && (hx < -g_margin_left + b || hx >= 240 + g_margin_right - b);
+    return (b && (hx < -g_margin_left + b || hx >= 240 + g_margin_right - b)) || in_black_rows(cy, y);
 }
 
 // A sprite's position and size in native-relative pixels. OAM Y is 8 bits:
@@ -387,8 +408,8 @@ GBA_MOD_CONSTRUCTOR(register_cull_hooks) {
 
 // BG0 carries text boxes, menus and the cinematic letterbox bars. A bar is a
 // row of solid one-colour tiles, so a side margin continues BG0 only where the
-// tile at the native screen edge is solid; text boxes (bordered, transparent
-// edges) stay put. Above and below the screen BG0 continues only when it covers
+// native screen edge shows that colour (side_fill); text boxes (bordered,
+// transparent edges) stay put. Above and below the screen BG0 continues only when it covers
 // the whole edge row (a bar, or a text box or menu against that edge): those
 // rows then take a solid tile of that row, so scenery the box hid natively
 // doesn't peek out past it.
@@ -407,6 +428,32 @@ bool solid_tile(const std::uint8_t* r, const std::uint8_t* vram, int hx, int y, 
         if (tile[i] != first) return false;
     *out = entry;
     return true;
+}
+
+// BG0's colour (palette bank and index) at native pixel (hx, y); 0 is transparent.
+int bg0_color_at(const std::uint8_t* r, const std::uint8_t* vram, int hx, int y) {
+    const std::uint32_t at = bg0_entry_at(r, hx, y);
+    const std::uint16_t entry = static_cast<std::uint16_t>(vram[at] | (vram[at + 1] << 8));
+    int px = (hx + (io16(r, 0x10) & 0x1FF)) & 7, py = (y + (io16(r, 0x12) & 0x1FF)) & 7;
+    if (entry & 0x400) px = 7 - px;
+    if (entry & 0x800) py = 7 - py;
+    const std::uint8_t pair = vram[((io16(r, 0x08) >> 2) & 3) * 0x4000u + (entry & 0x3FFu) * 32u + py * 4 + (px >> 1)];
+    const int index = (px & 1) ? pair >> 4 : pair & 15;
+    return index ? ((entry >> 12) << 4) | index : 0;
+}
+
+// A side margin continues BG0 on native row y when the edge tile is solid, or
+// when the edge pixel has the colour of a solid tile further along the row (a
+// menu bar whose edge tiles carry a frame line).
+bool side_fill(const std::uint8_t* r, const std::uint8_t* vram, int ex, int y, std::uint16_t* out) {
+    if (solid_tile(r, vram, ex, y, out)) return true;
+    const int color = bg0_color_at(r, vram, ex, y);
+    if (!color) return false;
+    for (int k = 1; k < 30; ++k) {
+        const int hx = ex == 0 ? 8 * k : 239 - 8 * k;
+        if (solid_tile(r, vram, hx, y, out) && bg0_color_at(r, vram, hx, y) == color) return true;
+    }
+    return false;
 }
 
 // For the top (y < 0) or bottom edge row: whether BG0 is opaque along all of
@@ -453,7 +500,7 @@ int extend_solid_edge(const std::uint8_t* r, int hx, int y, std::uint16_t* out) 
             return gba::kWsTilemapReplace;
         }
     }
-    return solid_tile(r, vram, ex, ey, out) ? gba::kWsTilemapReplace : gba::kWsTilemapUnavailable;
+    return side_fill(r, vram, ex, ey, out) ? gba::kWsTilemapReplace : gba::kWsTilemapUnavailable;
 }
 
 // Battles: BG2/BG3 are tiling background patterns (with per-line distortion),
@@ -496,6 +543,7 @@ struct RowView {
     int y = 0;
     bool hidden[4] = {};                   // per BG, outside every window it shows in
     int black_left = 0, black_right = 0;   // margin columns the centring black covers
+    bool black_row = false;                // a margin row the centring black covers
     int room_cx[4] = {}, room_cy[4] = {};  // per BG, the camera its rooms are measured in
     int org_x[4] = {}, org_y[4] = {};      // per BG, the world position of its top-left
 };
@@ -531,6 +579,7 @@ int provide(int bg, int hx, int y, std::uint16_t* out) {
         for (int b = 0; b <= 3; ++b) s_row.hidden[b] = hidden_outside_windows(r, 1 << b);
         int cx, cy;
         camera(r, 2, &cx, &cy);
+        s_row.black_row = in_black_rows(cy, y);
         const int black = black_width(cx, cy, y);
         s_row.black_left = -g_margin_left + black;
         s_row.black_right = 240 + g_margin_right - black;
@@ -539,7 +588,8 @@ int provide(int bg, int hx, int y, std::uint16_t* out) {
             origin(g, r, b, &s_row.org_x[b], &s_row.org_y[b]);
         }
     }
-    if (s_row.hidden[bg] || hx < s_row.black_left || hx >= s_row.black_right) return gba::kWsTilemapUnavailable;
+    if (s_row.hidden[bg] || s_row.black_row || hx < s_row.black_left || hx >= s_row.black_right)
+        return gba::kWsTilemapUnavailable;
     // BG0 answers per side (and, above and below the screen, once for the rest).
     const int cell = bg == 0 ? (hx < 0 ? -1 : hx >= 240 ? -2 : -3) : (s_row.room_cx[bg] + hx) >> 4;
     const int tile = bg == 0 ? 0 : (s_row.org_x[bg] + hx) >> 3;
@@ -591,6 +641,16 @@ void tick() {
     ++g_frame;
     g_margin_top = static_cast<int>(ppu->view_extra_top());
     g_margin_bottom = static_cast<int>(ppu->view_extra_bottom());
+    if (g_margin_top || g_margin_bottom) {
+        const std::uint8_t* fb = ppu->has_latched_framebuffer() ? ppu->latched_framebuffer() : nullptr;
+        for (int i = 0; i < 2; ++i) {
+            if (!fb) { g_edge_open[i] = true; continue; }
+            const std::uint8_t* row = fb + 3u * ((g_margin_top + (i ? 159u : 0u)) * ppu->render_width() + g_margin_left);
+            int lit = 0;
+            for (int x = 0; x < 240; ++x) lit += row[3 * x] + row[3 * x + 1] + row[3 * x + 2] > 48;
+            g_edge_open[i] = 2 * lit > 240;
+        }
+    }
     const Uint32 now = SDL_GetTicks();
     if (now < g_next) return;
     g_next = now + 50;
