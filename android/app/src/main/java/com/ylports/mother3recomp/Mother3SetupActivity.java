@@ -2,6 +2,7 @@ package com.ylports.mother3recomp;
 
 import android.app.AlertDialog;
 import android.content.Intent;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
@@ -14,6 +15,7 @@ import android.view.KeyEvent;
 import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Switch;
@@ -256,6 +258,24 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
             return box;
         }
 
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        // The party's portraits, from the player's ROM, at a whole multiple
+        // with no smoothing so the pixels stay sharp.
+        int scale = Math.max(1, dp(56) / Portraits.HEIGHT);
+        for (int number : card.party) {
+            Bitmap face = Portraits.load(rom, number);
+            if (face == null) continue;
+            ImageView view = new ImageView(this);
+            view.setImageBitmap(Bitmap.createScaledBitmap(face, Portraits.WIDTH * scale,
+                Portraits.HEIGHT * scale, false));
+            row.addView(view, size(-2, -2, 0, 0, 0, dp(6)));
+        }
+        LinearLayout info = new LinearLayout(this);
+        info.setOrientation(LinearLayout.VERTICAL);
+        row.addView(info, new LinearLayout.LayoutParams(0, -2, 1));
+        box.addView(row);
+
         LinearLayout top = new LinearLayout(this);
         TextView who = text(card.leader + "    Lv " + card.level, 20, INK);
         who.setTypeface(bold());
@@ -265,7 +285,7 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
             place.setTypeface(bold());
             top.addView(place);
         }
-        box.addView(top);
+        info.addView(top, size(-1, -2, 0, 0, dp(10), 0));
 
         LinearLayout middle = new LinearLayout(this);
         middle.setGravity(Gravity.CENTER_VERTICAL);
@@ -278,7 +298,7 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
         TextView time = text(card.playTime(), 18, INK);
         time.setTypeface(bold());
         middle.addView(time);
-        box.addView(middle, size(-1, -2, dp(4), 0));
+        info.addView(middle, size(-1, -2, dp(4), 0, dp(10), 0));
 
         if (when != null) box.addView(text(when, 14, INK_MUTED), size(-1, -2, dp(6), 0));
         return box;

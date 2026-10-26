@@ -31,13 +31,16 @@ import java.util.Locale;
  */
 final class GameCard {
     final String place;        // null when the ROM's table can't be trusted
+    final int[] party;         // character numbers, leader first
     final String leader;
     final int level;
     final List<String> companions;
     final long playFrames;
 
-    private GameCard(String place, String leader, int level, List<String> companions, long playFrames) {
+    private GameCard(String place, int[] party, String leader, int level, List<String> companions,
+                     long playFrames) {
         this.place = place;
+        this.party = party;
         this.leader = leader;
         this.level = level;
         this.companions = companions;
@@ -127,10 +130,12 @@ final class GameCard {
     private static GameCard build(ByteBuffer data, int characters, int room, long frames,
                                   int party, File rom) {
         List<String> names = new ArrayList<>();
+        int[] numbers = new int[4];
         int level = 0;
         for (int i = 0; i < 4; ++i) {
             int number = data.get(party + i) & 0xFF;
             if (number == 0) break;
+            numbers[i] = number;
             int block = characters + CHARACTER_SIZE * number;
             if (number > CHARACTER_COUNT || (data.get(block) & 0xFF) != number) return null;
             String name = decode(data, block + 2, 8);
@@ -139,8 +144,8 @@ final class GameCard {
             names.add(name);
         }
         if (names.isEmpty() || level < 1 || level > 99) return null;
-        return new GameCard(roomName(rom, room), names.get(0), level,
-            names.subList(1, names.size()), frames);
+        return new GameCard(roomName(rom, room), java.util.Arrays.copyOf(numbers, names.size()),
+            names.get(0), level, names.subList(1, names.size()), frames);
     }
 
     /** Up to `length` characters in the game's encoding, or null if one isn't plain text. */
@@ -163,12 +168,19 @@ final class GameCard {
     private static final int CHECK_ROOM = 11;
     private static final String CHECK_NAME = "Prayer Sanctuary";
 
+    /**
+     * Whether `rom` is laid out as this class (and Portraits) expect: another
+     * ROM (the Japanese one, a different patch) keeps its data elsewhere, so
+     * check a room name known to be in the table.
+     */
+    static boolean knownLayout(RandomAccessFile in) throws IOException {
+        return CHECK_NAME.equals(readRoom(in, CHECK_ROOM));
+    }
+
     static String roomName(File rom, int room) {
         if (room <= 0 || room >= ROOM_COUNT) return null;
         try (RandomAccessFile in = new RandomAccessFile(rom, "r")) {
-            // Another ROM (the Japanese one, a different patch) keeps its text
-            // elsewhere: check a name known to be in this table first.
-            if (!CHECK_NAME.equals(readRoom(in, CHECK_ROOM))) return null;
+            if (!knownLayout(in)) return null;
             String name = readRoom(in, room);
             return name == null || name.isEmpty() ? null : name;
         } catch (IOException e) {
