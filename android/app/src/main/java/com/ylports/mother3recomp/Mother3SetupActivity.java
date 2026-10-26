@@ -2,12 +2,21 @@ package com.ylports.mother3recomp;
 
 import android.app.AlertDialog;
 import android.content.Intent;
+import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.StateListDrawable;
 import android.os.Bundle;
 import android.text.InputType;
+import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -24,62 +33,75 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.function.Consumer;
 
 /**
- * Thin MOTHER 3 launcher diagnostic wrapper.
+ * MOTHER 3's Android front end, built for gamepads (D-pad focus, START plays,
+ * B goes back) as well as touch.
  *
- * Native stdout/stderr are redirected by gbarecomp to
- * files/android-runtime.log. If SDL_main returns or the previous native
- * process died, surface the tail here instead of making PLAY appear to do
- * nothing.
+ * The engine's setup screen asks for the ROM and BIOS the first time. Once
+ * they are in place this replaces it with three screens:
+ * - Home: Continue / Play, when the game was suspended, and a warning when
+ *   the in-game save is much older than the suspended game.
+ * - Settings: display, audio, controls, mods, game files, help.
+ * - Saves: the in-game save, the suspended game and its backups, cloud saves.
+ * RetroAchievements opens a dialog from Home.
  *
- * Also hosts the desktop launcher's MOTHER 3 settings (widescreen, in-game
- * button prompts, mods). They are stored in the same files the native side
- * reads on every platform: config.ini [Launcher] and mods/enabled.txt.
- *
- * Android extras: RetroAchievements login, cloud saves (RomM / Hoard), the
- * audio choice (Enhanced / HQ / Original), integer scaling, and suspend state
- * safety (backups before each game, a warning when the in-game save is old,
- * restoring a backup).
+ * Settings live where the native side reads them on every platform:
+ * config.ini ([Launcher], [Display], [Audio], [Touch]) and mods/enabled.txt.
+ * If SDL_main returns with an error, the log tail is shown on return.
  */
 public final class Mother3SetupActivity extends GbaSetupActivity {
     private static final int PICK_MOD = 2001;
     private static final long MAX_MOD_BYTES = 16L * 1024 * 1024;
     private static final String[] PROMPT_STYLES =
         {"Auto", "Xbox", "PlayStation", "Nintendo", "On-screen buttons"};
-    private static final String[] AUDIO_MODES = {"Enhanced", "HQ", "Original"};
-    private android.widget.LinearLayout modList;
+
+    private static final int BACKGROUND = Color.rgb(9, 11, 24);
+    private static final int SURFACE = Color.rgb(20, 25, 48);
+    private static final int OUTLINE = Color.rgb(48, 58, 92);
+    private static final int ACCENT = Color.rgb(78, 216, 255);
+    private static final int FOCUS = Color.rgb(255, 211, 78);
+    private static final int WARNING = Color.rgb(255, 211, 78);
+    private static final int TEXT = Color.WHITE;
+    private static final int TEXT_SECONDARY = Color.rgb(177, 187, 216);
+    private static final int TEXT_MUTED = Color.rgb(132, 143, 173);
+    private static final int OK_GREEN = Color.rgb(120, 235, 171);
+
+    private enum Page { HOME, SETTINGS, SAVES }
+
+    private Page page = Page.HOME;
     private GbaGameConfig gameConfig;
     private CloudSaves cloudSaves;
-    private Button raButton;
-    private Button cloudButton;
-    private TextView saveWarning;
 
     @Override
     protected boolean supportsAutomaticLaunch() { return false; }
 
     @Override
+    protected boolean setupShowsOptions() { return false; }
+
+    @Override
     protected void onCreate(Bundle savedInstanceState) {
-        // Before the setup screen checks for the ROM and builds the options.
+        // Before the setup screen checks for the ROM and builds the home screen.
         gameConfig = GbaGameConfig.load(this);
         LegacyFiles.migrate(getFilesDir(), gameConfig.romFile);
         ensureAudioChoice();
         cloudSaves = new CloudSaves(this, gameConfig.romFile,
             gameConfig.romSha1.length > 0 ? gameConfig.romSha1[0] : "",
-            this::refreshCloudButton);
+            this::redraw);
         super.onCreate(savedInstanceState);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        refreshSaveWarning();
-        refreshRetroAchievementsButton();
-        refreshCloudButton();
+        redraw();
         showNativeLogIfChanged();
         // Only after a game started from PLAY (remembered across recreation).
         cloudSaves.syncAfterPlay();
@@ -107,123 +129,376 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
         });
     }
 
-    private void showNativeLogIfChanged() {
-        File status = new File(getFilesDir(), "android-exit-code");
-        if (!status.isFile()) return;
-        try {
-            String code = readTail(status, 32).trim();
-            status.delete();
-            if (code.equals("0")) return;
-        } catch (IOException error) {
-            return;
+    /** START plays from Home; B (or Back) returns to Home from any other screen. */
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        final int key = event.getKeyCode();
+        final boolean back = key == KeyEvent.KEYCODE_BACK || key == KeyEvent.KEYCODE_BUTTON_B;
+        final boolean away = page != Page.HOME || isSetupScreenShown();
+        if (back && away && filesReady()) {
+            if (event.getAction() == KeyEvent.ACTION_UP) showPage(Page.HOME);
+            return true;
         }
-        File log = new File(getFilesDir(), "android-runtime.log");
-        if (!log.isFile() || log.length() == 0) return;
-
-        String text;
-        try {
-            text = readTail(log, 12000);
-        } catch (IOException error) {
-            return;
+        if (key == KeyEvent.KEYCODE_BUTTON_START && !away && filesReady()) {
+            if (event.getAction() == KeyEvent.ACTION_UP) play();
+            return true;
         }
-        if (text.trim().isEmpty()) return;
-
-        final String visible = lastLines(text, 45);
-        new AlertDialog.Builder(this)
-            .setTitle("MOTHER 3 - startup failed")
-            .setMessage(visible)
-            .setNeutralButton("Copy diagnostics", (dialog, which) -> copyDiagnostics())
-            .setPositiveButton("OK", null)
-            .show();
+        return super.dispatchKeyEvent(event);
     }
 
+    // ── Screens ───────────────────────────────────────────────────────────
+
     @Override
-    protected void addGameActions(android.widget.LinearLayout preferences) {
-        android.widget.Switch widescreen = new android.widget.Switch(this);
-        widescreen.setText("Widescreen (16:9 field and battles)");
-        styleOption(widescreen);
-        widescreen.setChecked("1".equals(iniValue("Launcher", "m3_widescreen")));
-        widescreen.setOnCheckedChangeListener((view, checked) ->
-            setIniValue("Launcher", "m3_widescreen", checked ? "1" : "0"));
-        preferences.addView(widescreen);
+    protected View buildHomeContent() {
+        page = Page.HOME;
+        return buildHome();
+    }
 
-        android.widget.Switch integerScale = new android.widget.Switch(this);
-        integerScale.setText("Integer scaling (whole-pixel multiples, the sharpest picture)");
-        styleOption(integerScale);
-        integerScale.setChecked("1".equals(iniValue("Display", "integer_scale")));
-        integerScale.setOnCheckedChangeListener((view, checked) ->
-            setIniValue("Display", "integer_scale", checked ? "1" : "0"));
-        preferences.addView(integerScale);
+    private void showPage(Page target) {
+        if (target == Page.HOME) {
+            page = Page.HOME;
+            showHomeScreen();
+            return;
+        }
+        page = target;
+        setContentView(target == Page.SETTINGS ? buildSettings() : buildSaves());
+    }
 
-        Button audio = new Button(this);
-        audio.setAllCaps(false);
-        audio.setText("Audio: " + AUDIO_MODES[audioMode()]);
-        audio.setOnClickListener(view -> chooseAudio(audio));
-        preferences.addView(audio);
+    /** Rebuilds the screen on show, so dates and statuses are current. */
+    private void redraw() {
+        if (!filesReady() || isSetupScreenShown()) return;
+        showPage(page);
+    }
 
-        saveWarning = new TextView(this);
-        saveWarning.setTextColor(android.graphics.Color.rgb(255, 211, 78));
-        saveWarning.setTextSize(13);
-        preferences.addView(saveWarning);
-        refreshSaveWarning();
+    private View buildHome() {
+        LinearLayout root = column();
+        root.setPadding(dp(48), dp(28), dp(48), dp(20));
 
-        Button backups = new Button(this);
-        backups.setAllCaps(false);
-        backups.setText("Suspend backups");
-        backups.setOnClickListener(view -> showSuspendBackups());
-        preferences.addView(backups);
+        LinearLayout header = new LinearLayout(this);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        TextView title = text(gameConfig.title, 28, TEXT);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        header.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+        String user = RaBridge.savedUser(getFilesDir());
+        TextView account = text(user != null ? "RetroAchievements · " + user : "", 13, TEXT_MUTED);
+        header.addView(account);
+        root.addView(header);
 
-        raButton = new Button(this);
-        raButton.setAllCaps(false);
-        raButton.setOnClickListener(view -> showRetroAchievementsDialog());
-        preferences.addView(raButton);
-        refreshRetroAchievementsButton();
+        LinearLayout center = column();
+        center.setGravity(Gravity.CENTER);
+        boolean suspended = suspendMarker().isFile() && suspendState().isFile();
+        Button primary = button((suspended ? "▶   Continue" : "▶   Play"), true);
+        primary.setTextSize(22);
+        primary.setOnClickListener(view -> play());
+        center.addView(primary, size(dp(420), dp(76), 0, 0));
+        TextView caption = text(suspended
+                ? "Suspended " + when(suspendState().lastModified())
+                : saveFile().isFile() ? "Starts from your in-game save" : "New game",
+            15, TEXT_SECONDARY);
+        caption.setGravity(Gravity.CENTER);
+        center.addView(caption, size(-2, -2, dp(10), 0));
+        String warning = saveWarning();
+        if (warning != null) {
+            TextView banner = text("!   " + warning, 14, WARNING);
+            // No border: a yellow border means "selected" everywhere else.
+            banner.setBackground(rounded(Color.argb(40, 255, 211, 78), Color.TRANSPARENT, 12));
+            banner.setPadding(dp(18), dp(12), dp(18), dp(12));
+            center.addView(banner, size(dp(620), -2, dp(22), 0));
+        }
+        root.addView(center, new LinearLayout.LayoutParams(-1, 0, 1));
 
-        cloudButton = new Button(this);
-        cloudButton.setAllCaps(false);
-        cloudButton.setOnClickListener(view -> cloudSaves.showSettings());
-        preferences.addView(cloudButton);
-        refreshCloudButton();
+        LinearLayout actions = new LinearLayout(this);
+        actions.setGravity(Gravity.CENTER);
+        Button settings = button("Settings", false);
+        settings.setOnClickListener(view -> showPage(Page.SETTINGS));
+        Button saves = button("Saves", false);
+        saves.setOnClickListener(view -> showPage(Page.SAVES));
+        Button achievements = button("Achievements", false);
+        achievements.setOnClickListener(view -> showRetroAchievementsDialog());
+        for (Button action : new Button[] {settings, saves, achievements})
+            actions.addView(action, size(dp(200), dp(54), 0, 0, dp(8), dp(8)));
+        root.addView(actions);
 
-        android.widget.Button prompts = new android.widget.Button(this);
+        TextView hint = text("START  play", 12, TEXT_MUTED);
+        hint.setGravity(Gravity.CENTER);
+        root.addView(hint, size(-1, -2, dp(14), 0));
+
+        primary.post(primary::requestFocus);
+        return root;
+    }
+
+    private View buildSettings() {
+        LinearLayout body = column();
+
+        body.addView(section("Display"));
+        body.addView(toggle("Widescreen (16:9)",
+            "Shows more of the field and battles. Applies when the game starts.",
+            "1".equals(iniValue("Launcher", "m3_widescreen")),
+            on -> setIniValue("Launcher", "m3_widescreen", on ? "1" : "0")));
+        body.addView(toggle("Integer scaling",
+            "Whole-pixel multiples: the sharpest picture, with thin borders.",
+            "1".equals(iniValue("Display", "integer_scale")),
+            on -> setIniValue("Display", "integer_scale", on ? "1" : "0")));
+        body.addView(toggle("Stretch to fill",
+            "Fills the whole screen; pixels are no longer square.",
+            fillDisplay(), this::setFillDisplay));
+        body.addView(toggle("Hide system bars", "Full screen, here and in the game.",
+            hideSystemBars(), this::setHideSystemBars));
+
+        body.addView(section("Audio"));
+        final int mode = audioMode();
+        String[][] modes = {
+            {"Enhanced (recommended)", "A high-precision mix of the original music, without the 8-bit hiss."},
+            {"HQ", "The game's own mixer patched to high quality. Changes the game's random numbers."},
+            {"Original", "The GBA's sound as it was."}};
+        for (int i = 0; i < modes.length; ++i) {
+            final int choice = i;
+            body.addView(choice(modes[i][0], modes[i][1], mode == i, () -> chooseAudio(choice)));
+        }
+
+        body.addView(section("Controls"));
+        body.addView(toggle("On-screen buttons", "Touch controls over the game.",
+            onScreenButtons(), this::setOnScreenButtons));
         int style = 0;
         try { style = Integer.parseInt(iniValue("Launcher", "m3_button_prompts")); }
         catch (NumberFormatException ignored) {}
-        final int[] current = {Math.max(0, Math.min(4, style))};
-        prompts.setText("In-game buttons: " + PROMPT_STYLES[current[0]]);
-        prompts.setAllCaps(false);
-        prompts.setOnClickListener(view -> {
-            current[0] = (current[0] + 1) % PROMPT_STYLES.length;
-            prompts.setText("In-game buttons: " + PROMPT_STYLES[current[0]]);
-            setIniValue("Launcher", "m3_button_prompts", Integer.toString(current[0]));
-        });
-        preferences.addView(prompts);
+        final int prompts = Math.max(0, Math.min(PROMPT_STYLES.length - 1, style));
+        body.addView(value("Button names in the game", "How the game's text names the buttons.",
+            PROMPT_STYLES[prompts], () -> {
+                setIniValue("Launcher", "m3_button_prompts",
+                    Integer.toString((prompts + 1) % PROMPT_STYLES.length));
+                showPage(Page.SETTINGS);
+            }));
 
-        android.widget.TextView modsTitle = new android.widget.TextView(this);
-        modsTitle.setText("Mods (IPS / BPS / UPS, applied in name order; long-press to remove)");
-        modsTitle.setTextColor(android.graphics.Color.rgb(164, 175, 207));
-        modsTitle.setTextSize(13);
-        preferences.addView(modsTitle);
-        modList = new android.widget.LinearLayout(this);
-        modList.setOrientation(android.widget.LinearLayout.VERTICAL);
-        preferences.addView(modList);
-        refreshMods();
-        android.widget.Button addMod = new android.widget.Button(this);
-        addMod.setText("Add mod");
-        addMod.setAllCaps(false);
-        addMod.setOnClickListener(view -> {
-            android.content.Intent intent =
-                new android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT);
-            intent.addCategory(android.content.Intent.CATEGORY_OPENABLE);
-            intent.setType("*/*");
-            startActivityForResult(intent, PICK_MOD);
-        });
-        preferences.addView(addMod);
+        body.addView(section("Mods"));
+        addMods(body);
 
-        android.widget.Button button = new android.widget.Button(this);
-        button.setText("Copy diagnostics");
-        button.setOnClickListener(view -> copyDiagnostics());
-        preferences.addView(button);
+        body.addView(section("Game files"));
+        body.addView(note("ROM " + (romInstalled() ? "verified" : "missing")
+            + "    ·    BIOS " + (biosInstalled() ? "verified" : "not provided")));
+        Button files = button("Change ROM, BIOS or language patch", false);
+        files.setOnClickListener(view -> showSetupScreen());
+        body.addView(files, size(-1, dp(52), dp(6), 0));
+
+        body.addView(section("Help"));
+        Button diagnostics = button("Copy diagnostics", false);
+        diagnostics.setOnClickListener(view -> copyDiagnostics());
+        body.addView(diagnostics, size(-1, dp(52), 0, 0));
+
+        return screen("Settings", body);
+    }
+
+    private View buildSaves() {
+        LinearLayout body = column();
+
+        body.addView(section("In-game save"));
+        body.addView(note(saveFile().isFile()
+            ? "Last saved " + when(saveFile().lastModified()) + ", at a save point in the game."
+            : "No in-game save yet."));
+        String warning = saveWarning();
+        if (warning != null) {
+            TextView alert = note(warning);
+            alert.setTextColor(WARNING);
+            body.addView(alert);
+        }
+
+        body.addView(section("Suspended game"));
+        boolean suspended = suspendMarker().isFile() && suspendState().isFile();
+        body.addView(note(suspended
+            ? "Suspended " + when(suspendState().lastModified()) + ". Continue picks up there."
+            : "None. Play starts from the in-game save."));
+        int copies = SuspendBackups.list(getFilesDir(), gameConfig.romFile).length;
+        body.addView(note(copies == 0
+            ? "A copy is kept each time a suspended game is resumed."
+            : copies + (copies == 1 ? " earlier point kept." : " earlier points kept.")));
+        Button restore = button("Resume from an earlier point", false);
+        restore.setOnClickListener(view -> showSuspendBackups());
+        body.addView(restore, size(-1, dp(52), dp(6), 0));
+
+        body.addView(section("Cloud saves"));
+        body.addView(note(cloudSaves.configured()
+            ? cloudSaves.buttonLabel().replace("Cloud saves: ", "Syncing with ")
+                + ", when you press Play and when the game closes."
+            : "Off. Keep the in-game save in sync with your own RomM or Hoard server."));
+        Button cloud = button(cloudSaves.configured() ? "Cloud settings" : "Set up cloud saves", false);
+        cloud.setOnClickListener(view -> cloudSaves.showSettings());
+        body.addView(cloud, size(-1, dp(52), dp(6), 0));
+
+        return screen("Saves", body);
+    }
+
+    // ── Building blocks ───────────────────────────────────────────────────
+
+    /** A titled screen: Back, the title, and a scrolling body. */
+    private View screen(String title, LinearLayout body) {
+        LinearLayout root = column();
+        root.setPadding(dp(48), dp(20), dp(48), 0);
+        LinearLayout header = new LinearLayout(this);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        Button back = button("‹  Back", false);
+        back.setOnClickListener(view -> showPage(Page.HOME));
+        header.addView(back, size(dp(140), dp(48), 0, 0, 0, dp(24)));
+        TextView heading = text(title, 24, TEXT);
+        heading.setTypeface(Typeface.DEFAULT_BOLD);
+        header.addView(heading);
+        root.addView(header);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        body.setPadding(0, dp(4), dp(14), dp(32));  // room for the scroll bar
+        scroll.addView(body);
+        root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        back.post(back::requestFocus);
+        return root;
+    }
+
+    private LinearLayout column() {
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setBackgroundColor(BACKGROUND);
+        return layout;
+    }
+
+    private TextView section(String title) {
+        TextView view = text(title.toUpperCase(Locale.US), 12, ACCENT);
+        view.setTypeface(Typeface.DEFAULT_BOLD);
+        view.setLetterSpacing(0.14f);
+        view.setPadding(0, dp(22), 0, dp(6));
+        return view;
+    }
+
+    private TextView note(String value) {
+        TextView view = text(value, 14, TEXT_SECONDARY);
+        view.setPadding(0, dp(2), 0, dp(2));
+        return view;
+    }
+
+    /** A focusable row: title, detail, and a switch the whole row toggles. */
+    private View toggle(String title, String detail, boolean checked, Consumer<Boolean> onChange) {
+        LinearLayout row = row(title, detail);
+        Switch control = new Switch(this);
+        control.setChecked(checked);
+        control.setFocusable(false);
+        control.setClickable(false);
+        row.addView(control);
+        row.setOnClickListener(view -> {
+            control.setChecked(!control.isChecked());
+            onChange.accept(control.isChecked());
+        });
+        return row;
+    }
+
+    /** A focusable row in a single-choice group. */
+    private View choice(String title, String detail, boolean selected, Runnable onPick) {
+        LinearLayout row = row(title, detail);
+        TextView mark = text(selected ? "●" : "○", 26, selected ? ACCENT : TEXT_MUTED);
+        row.addView(mark);
+        row.setOnClickListener(view -> onPick.run());
+        return row;
+    }
+
+    /** A focusable row that cycles a value. */
+    private View value(String title, String detail, String current, Runnable onNext) {
+        LinearLayout row = row(title, detail);
+        TextView shown = text(current + "  ›", 15, ACCENT);
+        row.addView(shown);
+        row.setOnClickListener(view -> onNext.run());
+        return row;
+    }
+
+    private LinearLayout row(String title, String detail) {
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setFocusable(true);
+        row.setClickable(true);
+        row.setBackground(states(SURFACE, Color.TRANSPARENT));
+        row.setPadding(dp(18), dp(10), dp(18), dp(10));
+        LinearLayout texts = new LinearLayout(this);
+        texts.setOrientation(LinearLayout.VERTICAL);
+        TextView name = text(title, 16, TEXT);
+        texts.addView(name);
+        if (detail != null && !detail.isEmpty()) texts.addView(text(detail, 13, TEXT_MUTED));
+        row.addView(texts, new LinearLayout.LayoutParams(0, -2, 1));
+        row.setLayoutParams(size(-1, -2, dp(4), 0));
+        return row;
+    }
+
+    private Button button(String label, boolean primary) {
+        Button button = new Button(this);
+        button.setText(label);
+        button.setAllCaps(false);
+        button.setTypeface(Typeface.DEFAULT_BOLD);
+        button.setTextSize(primary ? 18 : 15);
+        button.setTextColor(primary ? Color.rgb(8, 16, 27) : TEXT);
+        button.setFocusable(true);
+        button.setBackground(states(primary ? ACCENT : SURFACE, primary ? Color.TRANSPARENT : OUTLINE));
+        return button;
+    }
+
+    /** Background with a visible focus border: the platform highlight is hidden by custom fills. */
+    private Drawable states(int fill, int edge) {
+        StateListDrawable states = new StateListDrawable();
+        states.addState(new int[] {android.R.attr.state_pressed}, rounded(fill, FOCUS, 14));
+        states.addState(new int[] {android.R.attr.state_focused}, rounded(fill, FOCUS, 14));
+        states.addState(new int[] {}, rounded(fill, edge, 14));
+        return states;
+    }
+
+    private GradientDrawable rounded(int fill, int stroke, int radius) {
+        GradientDrawable shape = new GradientDrawable();
+        shape.setColor(fill);
+        shape.setCornerRadius(dp(radius));
+        shape.setStroke(dp(3), stroke);
+        return shape;
+    }
+
+    private TextView text(String value, float size, int color) {
+        TextView view = new TextView(this);
+        view.setText(value);
+        view.setTextSize(size);
+        view.setTextColor(color);
+        return view;
+    }
+
+    private LinearLayout.LayoutParams size(int width, int height, int top, int bottom) {
+        return size(width, height, top, bottom, 0, 0);
+    }
+
+    private LinearLayout.LayoutParams size(int width, int height, int top, int bottom, int left, int right) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(width, height);
+        params.setMargins(left, top, right, bottom);
+        return params;
+    }
+
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    private static String when(long millis) {
+        return new SimpleDateFormat("d MMM yyyy, HH:mm", Locale.US).format(new Date(millis));
+    }
+
+    // ── Files ─────────────────────────────────────────────────────────────
+
+    private String stem() {
+        String name = gameConfig.romFile;
+        int dot = name.lastIndexOf('.');
+        return dot >= 0 ? name.substring(0, dot) : name;
+    }
+
+    private File saveFile() { return new File(getFilesDir(), "roms/" + stem() + ".sav"); }
+    private File suspendState() { return new File(getFilesDir(), "roms/" + stem() + ".suspend.state"); }
+    private File suspendMarker() { return new File(getFilesDir(), "roms/" + stem() + ".suspend.pending"); }
+
+    /** The old-save warning, or null when the in-game save is recent enough. */
+    private String saveWarning() {
+        int days = SuspendBackups.saveLagDays(getFilesDir(), gameConfig.romFile);
+        if (days == 0) return null;
+        return (days == SuspendBackups.NO_SAVE
+                ? "No in-game save yet."
+                : "Your in-game save is " + days + (days == 1 ? " day" : " days")
+                    + " older than the suspended game.")
+            + " Save at a save point: progress since then lives only in the suspended game.";
     }
 
     // ── Audio ─────────────────────────────────────────────────────────────
@@ -247,7 +522,7 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
     /**
      * Android defaults to Enhanced audio until the player picks one. HQ off
      * must be written explicitly (the native default is on), and a player's
-     * existing [Audio] enhanced choice is kept: an update from the RG556 fork
+     * existing [Audio] enhanced choice is kept: an update from the RG556 port
      * keeps the stock ROM image, so its suspend state still resumes.
      */
     private void ensureAudioChoice() {
@@ -256,69 +531,35 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
         if (iniValue("Audio", "enhanced").isEmpty()) setIniValue("Audio", "enhanced", "1");
     }
 
-    private void chooseAudio(Button button) {
+    private void chooseAudio(int choice) {
         final int current = audioMode();
+        if (choice == current) return;
+        // HQ patches the ROM image, so a suspended game made with it on cannot
+        // resume with it off, and the other way round.
+        boolean romChanges = (current == 1) != (choice == 1);
+        if (!romChanges || !suspendMarker().isFile()) {
+            setAudioMode(choice);
+            showPage(Page.SETTINGS);
+            return;
+        }
         new AlertDialog.Builder(this)
-            .setTitle("Audio")
-            .setSingleChoiceItems(new String[] {
-                    "Enhanced: high-precision mix of the original music, without the 8-bit hiss",
-                    "HQ: the game's own mixer patched to high quality (changes the game's RNG)",
-                    "Original: the GBA's sound as it was"},
-                current, (dialog, which) -> {
-                    dialog.dismiss();
-                    if (which == current) return;
-                    Runnable apply = () -> {
-                        setAudioMode(which);
-                        button.setText("Audio: " + AUDIO_MODES[which]);
-                    };
-                    // HQ patches the ROM image, so a suspend state made with it
-                    // on cannot resume with it off, and the other way round.
-                    boolean romChanges = (current == 1) != (which == 1);
-                    if (!romChanges || !new File(getFilesDir(), "roms/" + stem() + ".suspend.pending").isFile()) {
-                        apply.run();
-                        return;
-                    }
-                    new AlertDialog.Builder(this)
-                        .setTitle("Switch HQ audio?")
-                        .setMessage("HQ audio changes the game image, so your suspended game can't be "
-                            + "resumed after this switch: the game starts from your in-game save. "
-                            + "A copy of the suspend state is kept in Suspend backups; switch back "
-                            + "and restore it to continue from there.")
-                        .setPositiveButton("Switch", (d, w) -> {
-                            SuspendBackups.keep(getFilesDir(), gameConfig.romFile);
-                            apply.run();
-                        })
-                        .setNegativeButton("Cancel", null)
-                        .show();
-                })
+            .setTitle(choice == 1 ? "Turn HQ audio on?" : "Turn HQ audio off?")
+            .setMessage("HQ audio changes the game image, so the suspended game can't continue "
+                + "after this switch: the game starts from your in-game save. A copy of the "
+                + "suspended game is kept in Saves; switch back and restore it to continue "
+                + "from there.")
+            .setPositiveButton("Switch", (dialog, which) -> {
+                SuspendBackups.keep(getFilesDir(), gameConfig.romFile);
+                setAudioMode(choice);
+                showPage(Page.SETTINGS);
+            })
             .setNegativeButton("Cancel", null)
             .show();
     }
 
-    private String stem() {
-        String name = gameConfig.romFile;
-        int dot = name.lastIndexOf('.');
-        return dot >= 0 ? name.substring(0, dot) : name;
-    }
+    // ── Suspended game backups ────────────────────────────────────────────
 
-    // ── Suspend state safety ──────────────────────────────────────────────
-
-    private void refreshSaveWarning() {
-        if (saveWarning == null) return;
-        int days = SuspendBackups.saveLagDays(getFilesDir(), gameConfig.romFile);
-        if (days == 0) {
-            saveWarning.setVisibility(View.GONE);
-            return;
-        }
-        saveWarning.setText((days == SuspendBackups.NO_SAVE
-                ? "No in-game save yet."
-                : "Your in-game save is " + days + (days == 1 ? " day" : " days")
-                    + " older than where you left off.")
-            + "\nSave in the game: progress since then lives only in the suspend state.");
-        saveWarning.setVisibility(View.VISIBLE);
-    }
-
-    /** Lists the suspend-state backups and puts one back for the next PLAY. */
+    /** Lists the suspend-state backups and puts one back for the next Continue. */
     private void showSuspendBackups() {
         if (org.libsdl.app.SdlSession.nativeRunning()) {
             // It would write its own state over the restored one when it suspends.
@@ -329,8 +570,8 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
         File[] backups = SuspendBackups.list(getFilesDir(), gameConfig.romFile);
         if (backups.length == 0) {
             new AlertDialog.Builder(this)
-                .setTitle("Suspend backups")
-                .setMessage("No backups yet. One is made each time PLAY resumes a suspended game.")
+                .setTitle("Earlier points")
+                .setMessage("None yet. A copy is kept each time a suspended game is resumed.")
                 .setPositiveButton("OK", null)
                 .show();
             return;
@@ -347,18 +588,18 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
     private void confirmRestore(File backup, String label) {
         new AlertDialog.Builder(this)
             .setTitle("Resume from " + label + "?")
-            .setMessage("PLAY will continue from this point. Where you are now is backed up "
+            .setMessage("Continue will pick up from this point. Where you are now is kept "
                 + "first, so you can come back to it from this list.")
             .setPositiveButton("Restore", (dialog, which) -> {
                 try {
                     SuspendBackups.restore(getFilesDir(), gameConfig.romFile, backup);
-                    Toast.makeText(this, "Restored. PLAY resumes from " + label + ".",
+                    Toast.makeText(this, "Restored. Continue picks up from " + label + ".",
                         Toast.LENGTH_LONG).show();
                 } catch (IOException e) {
                     Toast.makeText(this, "Restore failed: " + e.getMessage(),
                         Toast.LENGTH_LONG).show();
                 }
-                refreshSaveWarning();
+                redraw();
             })
             .setNegativeButton("Cancel", null)
             .show();
@@ -366,34 +607,23 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
 
     /** "25 Oct 2026, 19:45" from mother3_en_v13.20261025-194529.state. */
     private static String backupLabel(File backup) {
-        String name = backup.getName();
-        String[] parts = name.split("\\.");
+        String[] parts = backup.getName().split("\\.");
         if (parts.length >= 3) {
             try {
-                java.util.Date when = new java.text.SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US)
+                Date stamp = new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US)
                     .parse(parts[parts.length - 2]);
-                if (when != null) {
-                    return new java.text.SimpleDateFormat("d MMM yyyy, HH:mm", Locale.US).format(when);
-                }
+                if (stamp != null) return when(stamp.getTime());
             } catch (java.text.ParseException ignored) {
                 // fall back to the file name
             }
         }
-        return name;
+        return backup.getName();
     }
 
-    // ── RetroAchievements and cloud saves ─────────────────────────────────
-
-    private void refreshCloudButton() {
-        if (cloudButton != null) cloudButton.setText(cloudSaves.buttonLabel());
-    }
+    // ── RetroAchievements ─────────────────────────────────────────────────
 
     private void refreshRetroAchievementsButton() {
-        if (raButton == null) return;
-        String user = RaBridge.savedUser(getFilesDir());
-        raButton.setText(user != null
-            ? "RetroAchievements: " + user
-            : "RetroAchievements: log in");
+        redraw();
     }
 
     private void showRetroAchievementsDialog() {
@@ -481,13 +711,84 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
         dialog.show();
     }
 
-    private void styleOption(android.widget.CompoundButton option) {
-        option.setTextColor(android.graphics.Color.rgb(203, 212, 238));
-        option.setTextSize(14);
-        option.setMinHeight(Math.round(52 * getResources().getDisplayMetrics().density));
+    // ── Mods ──────────────────────────────────────────────────────────────
+
+    /** One row per installed patch (select to switch it on or off, long-press to remove), then Add. */
+    private void addMods(LinearLayout body) {
+        String[] names = modsDir().list((dir, name) -> isModFile(name));
+        if (names == null || names.length == 0) {
+            body.addView(note("No mods installed. IPS, BPS and UPS patches are applied in name order."));
+        } else {
+            Arrays.sort(names);
+            final List<String> on = enabledMods();
+            for (String name : names) {
+                View row = toggle(name, null, on.contains(name), checked -> {
+                    List<String> now = enabledMods();
+                    now.remove(name);
+                    if (checked) now.add(name);
+                    saveEnabledMods(now);
+                });
+                row.setOnLongClickListener(view -> {
+                    new AlertDialog.Builder(this)
+                        .setTitle("Remove mod?")
+                        .setMessage(name)
+                        .setPositiveButton("Remove", (dialog, which) -> {
+                            new File(modsDir(), name).delete();
+                            List<String> now = enabledMods();
+                            now.remove(name);
+                            saveEnabledMods(now);
+                            showPage(Page.SETTINGS);
+                        })
+                        .setNegativeButton("Cancel", null)
+                        .show();
+                    return true;
+                });
+                body.addView(row);
+            }
+        }
+        Button add = button("Add mod", false);
+        add.setOnClickListener(view -> {
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("*/*");
+            startActivityForResult(intent, PICK_MOD);
+        });
+        body.addView(add, size(-1, dp(52), dp(6), 0));
     }
 
+    // ── Settings files and diagnostics ────────────────────────────────────
+
     private File modsDir() { return new File(getFilesDir(), "mods"); }
+
+    private void showNativeLogIfChanged() {
+        File status = new File(getFilesDir(), "android-exit-code");
+        if (!status.isFile()) return;
+        try {
+            String code = readTail(status, 32).trim();
+            status.delete();
+            if (code.equals("0")) return;
+        } catch (IOException error) {
+            return;
+        }
+        File log = new File(getFilesDir(), "android-runtime.log");
+        if (!log.isFile() || log.length() == 0) return;
+
+        String text;
+        try {
+            text = readTail(log, 12000);
+        } catch (IOException error) {
+            return;
+        }
+        if (text.trim().isEmpty()) return;
+
+        final String visible = lastLines(text, 45);
+        new AlertDialog.Builder(this)
+            .setTitle("MOTHER 3 - startup failed")
+            .setMessage(visible)
+            .setNeutralButton("Copy diagnostics", (dialog, which) -> copyDiagnostics())
+            .setPositiveButton("OK", null)
+            .show();
+    }
 
     private static boolean isModFile(String name) {
         String lower = name.toLowerCase(Locale.US);
@@ -521,49 +822,6 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
         }
     }
 
-    private void refreshMods() {
-        if (modList == null) return;
-        modList.removeAllViews();
-        String[] names = modsDir().list((dir, name) -> isModFile(name));
-        if (names == null || names.length == 0) {
-            android.widget.TextView none = new android.widget.TextView(this);
-            none.setText("No mods installed.");
-            none.setTextColor(android.graphics.Color.rgb(132, 143, 173));
-            modList.addView(none);
-            return;
-        }
-        Arrays.sort(names);
-        final List<String> on = enabledMods();
-        for (String name : names) {
-            android.widget.CheckBox box = new android.widget.CheckBox(this);
-            box.setText(name);
-            styleOption(box);
-            box.setChecked(on.contains(name));
-            box.setOnCheckedChangeListener((view, checked) -> {
-                List<String> now = enabledMods();
-                now.remove(name);
-                if (checked) now.add(name);
-                saveEnabledMods(now);
-            });
-            box.setOnLongClickListener(view -> {
-                new AlertDialog.Builder(this)
-                    .setTitle("Remove mod?")
-                    .setMessage(name)
-                    .setPositiveButton("Remove", (dialog, which) -> {
-                        new File(modsDir(), name).delete();
-                        List<String> now = enabledMods();
-                        now.remove(name);
-                        saveEnabledMods(now);
-                        refreshMods();
-                    })
-                    .setNegativeButton("Cancel", null)
-                    .show();
-                return true;
-            });
-            modList.addView(box);
-        }
-    }
-
     @Override
     protected void onActivityResult(int requestCode, int resultCode, android.content.Intent data) {
         if (requestCode != PICK_MOD) {
@@ -573,7 +831,7 @@ public final class Mother3SetupActivity extends GbaSetupActivity {
         if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
         try {
             importMod(data.getData());
-            refreshMods();
+            showPage(Page.SETTINGS);
         } catch (IOException error) {
             new AlertDialog.Builder(this)
                 .setTitle("Mod not added")
