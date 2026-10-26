@@ -16,6 +16,7 @@
 #include "m3_settings.h"
 #include "m3_setup.h"
 #include "m3_smooth.h"
+#include "m3_widescreen.h"
 #if defined(MOTHER3_RETROACHIEVEMENTS)
 #include "retroachievements.h"
 #endif
@@ -40,6 +41,17 @@
 extern "C" const unsigned kDispatchTableLen;
 
 namespace {
+// The widescreen field model is checked at vblank, when the game's scroll
+// state, layer offsets and VRAM agree. Checked mid-frame it could catch a sky
+// layer mid-update (the clouds rebase every 16 px) and drop it for a tick,
+// so clouds flickered at the old screen edges. RunOptions::vblank_frame has
+// one owner; whatever was installed before (RetroAchievements) runs after.
+void (*g_next_vblank)() = nullptr;
+void mother3_vblank() {
+    m3widescreen::tick();  // throttles itself; nothing to do at 240 px
+    if (g_next_vblank) g_next_vblank();
+}
+
 constexpr const char* kEnglishSha1 = "306fb8874533b0fd0796208faa8bed2db4ae77fb";
 constexpr const char* kHqAudioSha1 = "4ffe71ce5c5e1e8d9be5fbd09968b60787169b21";
 constexpr const char* kJapanSha1   = "4f0f493e12c2a8c61b2d809af03f7abf87a85776";
@@ -245,6 +257,8 @@ int mother3_main(int argc, char** argv) {
     if (game_launcher_preboot(args, opts)) return 0;
 #endif
 #endif
+    g_next_vblank = opts.vblank_frame;
+    opts.vblank_frame = &mother3_vblank;
     std::vector<char*> av;
     av.reserve(args.size());
     for (auto& arg : args) av.push_back(arg.data());
