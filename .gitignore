@@ -64,3 +64,6 @@ build-android-host/
 
 # Pinned by dependencies.lock.json, fetched by tools/setup_deps.py
 third_party/rcheevos/
+
+# tools/rg556-health.sh snapshots
+health/
