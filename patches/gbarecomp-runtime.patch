@@ -900,7 +900,7 @@ index 53ba221..73449b9 100644
          return static_cast<uint16_t>(host_keyinput_ & synth_keyinput_ & 0x03FFu);
      }
 diff --git a/src/gba/gba_ppu.cpp b/src/gba/gba_ppu.cpp
-index 0454527..731b0d4 100644
+index 0454527..9c7aa75 100644
 --- a/src/gba/gba_ppu.cpp
 +++ b/src/gba/gba_ppu.cpp
 @@ -33,6 +33,8 @@ extern "C" int g_ws_affine_filter_enabled = 0;
@@ -918,7 +918,7 @@ index 0454527..731b0d4 100644
  extern "C" const WsMarginObjPixel* (*g_ws_obj_margin_provider)(int, int*, int*) = nullptr;
 +extern "C" int g_ppu_record_motion = 0;
 +extern "C" int (*g_present_interpolator)(const GbaPpu*, const uint8_t*, uint32_t, uint32_t,
-+                                         uint8_t*) = nullptr;
++                                         uint8_t*, float) = nullptr;
  
  namespace {
  
@@ -1122,7 +1122,7 @@ index 0454527..731b0d4 100644
      if (high_resolution_) high_resolution_->latch();
      if (presentation_) presentation_->frame_ready();
 diff --git a/src/gba/gba_ppu.h b/src/gba/gba_ppu.h
-index 3563e70..984bcc5 100644
+index 3563e70..9f981d6 100644
 --- a/src/gba/gba_ppu.h
 +++ b/src/gba/gba_ppu.h
 @@ -166,6 +166,10 @@ public:
@@ -1181,24 +1181,25 @@ index 3563e70..984bcc5 100644
  extern "C" int g_ws_pillarbox;  // Step C policy: black margins on non-field screens
  extern "C" int g_ws_pillarbox_left;
  extern "C" int g_ws_pillarbox_right;
-@@ -317,6 +345,15 @@ extern "C" int (*g_ws_obj_attr_y_provider)(int oam_index,
+@@ -317,6 +345,16 @@ extern "C" int (*g_ws_obj_attr_y_provider)(int oam_index,
  // keeps the established expanded-viewport OBJ test.
  extern "C" int g_ws_obj_native_clip;
  
 +// Present-time frame interpolation (host-only, default off). While
 +// g_ppu_record_motion is nonzero the PPU keeps the motion record above. A
-+// runtime with g_present_interpolator set calls it with each finished frame
-+// before presenting; returning nonzero means out2x now holds a (2w x 2h RGB888)
-+// frame for half a frame period earlier, which is presented first.
++// runtime with g_present_interpolator set calls it once per display refresh
++// with the newest finished frame and how far (0 <= t < 1) the moment shown
++// lies from the previous frame to it; returning nonzero means out2x now holds
++// that moment as a (2w x 2h RGB888) frame. Zero means no smooth motion now.
 +extern "C" int g_ppu_record_motion;
 +extern "C" int (*g_present_interpolator)(const GbaPpu* ppu, const uint8_t* rgb,
-+                                         uint32_t w, uint32_t h, uint8_t* out2x);
++                                         uint32_t w, uint32_t h, uint8_t* out2x, float t);
 +
  // Read-only, game-authored OBJ coverage for expanded margins. RGB555 bit 15
  // marks a transparent pixel. Priority uses the hardware 0..3 BG/OBJ order.
  // The PPU never consumes this layer inside the native 240x160 viewport.
 diff --git a/src/runtime/host_platform.cpp b/src/runtime/host_platform.cpp
-index 07f5de5..cc9a4f3 100644
+index 07f5de5..2be7e91 100644
 --- a/src/runtime/host_platform.cpp
 +++ b/src/runtime/host_platform.cpp
 @@ -1,5 +1,7 @@
@@ -1229,7 +1230,7 @@ index 07f5de5..cc9a4f3 100644
  void FramePacer::wait_for_next_frame(uint64_t frames) {
      if (uncapped_) {
          next_ = clock::now();  // keep the deadline current for re-cap
-@@ -70,17 +83,51 @@ void FramePacer::wait_for_next_frame(uint64_t frames) {
+@@ -70,17 +83,61 @@ void FramePacer::wait_for_next_frame(uint64_t frames) {
      // of trying to replay the lost time (avoids a catch-up death spiral
      // after a hitch or a breakpoint pause).
      if (now > next_ + period_) {
@@ -1262,10 +1263,20 @@ index 07f5de5..cc9a4f3 100644
 +    }
 +}
 +
-+void FramePacer::wait_half_frame() {
-+    if (uncapped_) return;
-+    const clock::time_point target = next_ - period_ / 2;
-+    if (clock::now() < target) sleep_until_point(target);
++FramePacer::clock::time_point FramePacer::smooth_origin() {
++    // Presenting interpolated frames as soon as they were ready made the gap
++    // to the next one shrink with the emulate time (6 of 8.4 ms), and on a
++    // 120 Hz display two landed in one refresh, so only 60 fps showed. The
++    // lead jumps up to a slow frame and eases back down 50 us per frame.
++    const clock::time_point start = next_ - period_;
++    const auto busy = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start);
++    lead_ = std::clamp(std::max(busy + std::chrono::milliseconds(2), lead_ - std::chrono::microseconds(50)),
++                       std::chrono::nanoseconds(0), period_ / 2);
++    return start + lead_;
++}
++
++void FramePacer::sleep_until(clock::time_point t) {
++    if (!uncapped_ && clock::now() < t) sleep_until_point(t);
 +}
 +
 +void FramePacer::sleep_until_point(clock::time_point target) {
@@ -1283,7 +1294,7 @@ index 07f5de5..cc9a4f3 100644
              LARGE_INTEGER due;
              due.QuadPart = -static_cast<LONGLONG>(
                  due_ns >= 100 ? due_ns / 100 : 1);
-@@ -88,33 +135,23 @@ void FramePacer::wait_for_next_frame(uint64_t frames) {
+@@ -88,33 +145,23 @@ void FramePacer::wait_for_next_frame(uint64_t frames) {
              if (SetWaitableTimer(t, &due, 0, nullptr, nullptr, FALSE)) {
                  WaitForSingleObject(t, INFINITE);
              } else {
@@ -1323,20 +1334,25 @@ index 07f5de5..cc9a4f3 100644
  
  std::vector<unsigned char> read_file(const std::string& path, std::string* error) {
 diff --git a/src/runtime/host_platform.h b/src/runtime/host_platform.h
-index 42208db..4a15227 100644
+index 42208db..10b3158 100644
 --- a/src/runtime/host_platform.h
 +++ b/src/runtime/host_platform.h
-@@ -52,6 +52,9 @@ public:
+@@ -52,6 +52,14 @@ public:
      // old behavior. Fast-forward presents one frame per wait already, so
      // it is unaffected. The behind-resync below still bounds real stalls.
      void wait_for_next_frame(uint64_t frames = 1);
-+    // Block until halfway to the next deadline (no deadline change): the slot
-+    // for an interpolated frame presented between two real ones.
-+    void wait_half_frame();
++    // Smooth motion: when the previous frame should be fully on screen. It
++    // trails this frame's start by the slowest recent emulate time plus 2 ms,
++    // so the frames drawn between it and this one keep an even pace.
++    std::chrono::steady_clock::time_point smooth_origin();
++    std::chrono::steady_clock::time_point frame_start() const { return next_ - period_; }
++    std::chrono::nanoseconds period() const { return period_; }
++    // Sleep until `t` without moving the deadline. No-op while uncapped.
++    void sleep_until(std::chrono::steady_clock::time_point t);
  
      // Realign the deadline to "now". Call after any non-real-time jump
      // (startup, save-state load) so the pacer doesn't try to catch up.
-@@ -64,8 +67,13 @@ public:
+@@ -64,8 +72,14 @@ public:
  
  private:
      using clock = std::chrono::steady_clock;
@@ -1347,11 +1363,12 @@ index 42208db..4a15227 100644
 +    // stays real-time on average (audio production would otherwise fall
 +    // behind the host's audio clock) without a visibly short frame.
 +    std::chrono::nanoseconds debt_{0};
++    std::chrono::nanoseconds lead_{};  // smooth_origin()'s offset into the frame
      bool uncapped_ = false;
      bool raised_timer_res_ = false;
      // HP-002: Windows high-resolution waitable timer (HANDLE, void* here to
 diff --git a/src/runtime/host_window.cpp b/src/runtime/host_window.cpp
-index 496d741..4d1aa87 100644
+index 496d741..349f4b0 100644
 --- a/src/runtime/host_window.cpp
 +++ b/src/runtime/host_window.cpp
 @@ -23,6 +23,7 @@
@@ -1692,10 +1709,47 @@ index 496d741..4d1aa87 100644
      b->texture = replacement;
      b->presentation_source_w = b->presentation_source_h = 0;
      b->base_w = base_w;
-@@ -2372,6 +2512,12 @@ bool HostWindow::drawable_size(int* width, int* height) const {
+@@ -2372,6 +2512,49 @@ bool HostWindow::drawable_size(int* width, int* height) const {
  
  void HostWindow::present(const uint8_t* rgb888) { present(rgb888, 0, 0); }
  
++bool HostWindow::display_timing(std::chrono::nanoseconds* period,
++                                std::chrono::steady_clock::time_point* vblank) const {
++    if (!open_ || !impl_ || !period || !vblank) return false;
++    auto* b = static_cast<Backend*>(impl_);
++    SDL_DisplayMode mode{};
++    const int index = SDL_GetWindowDisplayIndex(b->window);
++    const int hz = SDL_GetCurrentDisplayMode(index < 0 ? 0 : index, &mode) == 0 ? mode.refresh_rate : 0;
++    if (hz <= 0) return false;
++    *period = std::chrono::nanoseconds(1000000000LL / hz);
++#if defined(_WIN32)
++    // The compositor's clock gives the vblank phase. It times one display, so
++    // it is only used when its rate matches the window's display.
++    using Gcti = HRESULT (WINAPI*)(HWND, DWM_TIMING_INFO*);
++    static const Gcti gcti = [] {
++        HMODULE m = LoadLibraryA("dwmapi.dll");
++        return m ? reinterpret_cast<Gcti>(reinterpret_cast<void*>(GetProcAddress(m, "DwmGetCompositionTimingInfo")))
++                 : nullptr;
++    }();
++    DWM_TIMING_INFO ti{};
++    ti.cbSize = sizeof(ti);
++    LARGE_INTEGER freq{}, qpc{};
++    if (gcti && SUCCEEDED(gcti(nullptr, &ti)) && ti.qpcRefreshPeriod && QueryPerformanceFrequency(&freq) &&
++        QueryPerformanceCounter(&qpc)) {
++        const auto now = std::chrono::steady_clock::now();
++        auto ns = [&](long long q) {
++            return std::chrono::nanoseconds(static_cast<long long>(static_cast<double>(q) * 1e9 / freq.QuadPart));
++        };
++        const auto dwm = ns(static_cast<long long>(ti.qpcRefreshPeriod));
++        if (std::abs((dwm - *period).count()) * 20 < period->count()) {  // within 5%
++            *period = dwm;
++            *vblank = now - ns(static_cast<long long>(qpc.QuadPart - ti.qpcVBlank));
++        }
++    }
++#endif
++    return true;
++}
++
 +void HostWindow::present_scaled(const uint8_t* rgb888, int factor) {
 +    if (!open_ || !impl_ || (factor != 1 && factor != 2)) return;
 +    auto* b = static_cast<Backend*>(impl_);
@@ -1705,7 +1759,7 @@ index 496d741..4d1aa87 100644
  void HostWindow::present(const uint8_t* rgb888, unsigned sampled_w, unsigned sampled_h) {
      if (!open_ || !impl_ || !rgb888) return;
      auto* b = static_cast<Backend*>(impl_);
-@@ -2389,26 +2535,38 @@ void HostWindow::present(const uint8_t* rgb888, unsigned sampled_w, unsigned sam
+@@ -2389,26 +2572,38 @@ void HostWindow::present(const uint8_t* rgb888, unsigned sampled_w, unsigned sam
          };
          while ((info.max_texture_width > 0 && upload_w > unsigned(info.max_texture_width)) ||
                 (info.max_texture_height > 0 && upload_h > unsigned(info.max_texture_height))) shrink();
@@ -1759,7 +1813,7 @@ index 496d741..4d1aa87 100644
      }
      // Large elective scales can exceed an older GPU's texture limit. Keep the
      // complete CPU raster and reduce only the upload, preserving logical view
-@@ -2507,43 +2665,12 @@ void HostWindow::present(const uint8_t* rgb888, unsigned sampled_w, unsigned sam
+@@ -2507,43 +2702,12 @@ void HostWindow::present(const uint8_t* rgb888, unsigned sampled_w, unsigned sam
      }
      if (touch_input_enabled(b)) publish_touch_presentation(b);
  #if defined(__ANDROID__)
@@ -1805,7 +1859,7 @@ index 496d741..4d1aa87 100644
      }
  #endif
      render_host_layers(b);
-@@ -2585,6 +2712,17 @@ void HostWindow::load_input_config(const char* dir,
+@@ -2585,6 +2749,17 @@ void HostWindow::load_input_config(const char* dir,
          fast_forward_multiplier_default, 2, 10);
      const std::string base = std::string(dir) + "/";
  
@@ -1823,7 +1877,7 @@ index 496d741..4d1aa87 100644
      // keybinds.ini [player1] (recomp-ui generic format, scancode names).
      ini_scan_section((base + "keybinds.ini").c_str(), "player1",
                       [b](const char* key, const char* val) {
-@@ -2643,9 +2781,8 @@ void HostWindow::set_fullscreen(int mode) {
+@@ -2643,9 +2818,8 @@ void HostWindow::set_fullscreen(int mode) {
      if (!open_ || !impl_) return;
      auto* b = static_cast<Backend*>(impl_);
  #if defined(__ANDROID__)
@@ -1835,7 +1889,7 @@ index 496d741..4d1aa87 100644
      return;
  #endif
      if (mode < 0) mode = 0;
-@@ -2716,6 +2853,9 @@ void HostWindow::set_linear_filter(bool enabled) {
+@@ -2716,6 +2890,9 @@ void HostWindow::set_linear_filter(bool enabled) {
  #if SDL_VERSION_ATLEAST(2, 0, 12)
      SDL_SetTextureScaleMode(b->texture,
          enabled ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
@@ -1845,7 +1899,7 @@ index 496d741..4d1aa87 100644
  #endif
  }
  
-@@ -2735,6 +2875,19 @@ bool HostWindow::audio_enabled() const {
+@@ -2735,6 +2912,19 @@ bool HostWindow::audio_enabled() const {
      return b->audio_dev && SDL_GetAudioDeviceStatus(b->audio_dev) == SDL_AUDIO_PLAYING;
  }
  
@@ -1865,7 +1919,7 @@ index 496d741..4d1aa87 100644
  void HostWindow::set_resize_driven_view(bool enabled) {
      if (!open_ || !impl_) return;
      auto* b = static_cast<Backend*>(impl_);
-@@ -2755,6 +2908,41 @@ void HostWindow::set_runtime_ui(RecompRuntimeUi* ui) {
+@@ -2755,6 +2945,41 @@ void HostWindow::set_runtime_ui(RecompRuntimeUi* ui) {
      if (!open_ || !impl_) return;
      static_cast<Backend*>(impl_)->runtime_ui = ui;
  }
@@ -1907,7 +1961,7 @@ index 496d741..4d1aa87 100644
  #endif
  
  void HostWindow::configure_touch(bool policy, std::uint32_t claims,
-@@ -2777,13 +2965,16 @@ void HostWindow::configure_touch(bool policy, std::uint32_t claims,
+@@ -2777,13 +3002,16 @@ void HostWindow::configure_touch(bool policy, std::uint32_t claims,
      if (!b->pad_choice_saved) {
          const bool platform_default =
  #if defined(__ANDROID__)
@@ -1926,7 +1980,7 @@ index 496d741..4d1aa87 100644
      TouchHub& hub = TouchHub::instance();
      hub.set_claims(policy ? claims : 0);
      // A game that owns long-press gets a snappier threshold; the engine's own
-@@ -2809,7 +3000,8 @@ void HostWindow::set_touch_config_dir(const char* dir) {
+@@ -2809,7 +3037,8 @@ void HostWindow::set_touch_config_dir(const char* dir) {
      ini_scan_section((b->touch_config_dir + "/config.ini").c_str(), "Touch",
                       [b](const char* key, const char* val) {
          if (SDL_strcasecmp(key, "pad_visible") == 0) {
@@ -1936,7 +1990,7 @@ index 496d741..4d1aa87 100644
              b->pad_choice_saved = true;
          } else if (SDL_strcasecmp(key, "toggle_x") == 0) {
              b->toggle_fx = std::clamp(static_cast<float>(std::atof(val)), 0.0f, 1.0f);
-@@ -2819,6 +3011,13 @@ void HostWindow::set_touch_config_dir(const char* dir) {
+@@ -2819,6 +3048,13 @@ void HostWindow::set_touch_config_dir(const char* dir) {
              b->toggle_pos_saved = true;
          }
      });
@@ -1950,7 +2004,7 @@ index 496d741..4d1aa87 100644
      ini_scan_section((b->touch_config_dir + "/config.ini").c_str(), "Audio",
                       [b](const char* key, const char* val) {
          if (SDL_strcasecmp(key, "enhanced") == 0) {
-@@ -2828,6 +3027,22 @@ void HostWindow::set_touch_config_dir(const char* dir) {
+@@ -2828,6 +3064,22 @@ void HostWindow::set_touch_config_dir(const char* dir) {
      });
  }
  
@@ -1973,7 +2027,7 @@ index 496d741..4d1aa87 100644
  bool HostWindow::saved_audio_enhanced(bool& enabled) const {
      if (!open_ || !impl_) return false;
      auto* b = static_cast<const Backend*>(impl_);
-@@ -2853,9 +3068,12 @@ void HostWindow::set_touch_pad_visible(bool visible) {
+@@ -2853,9 +3105,12 @@ void HostWindow::set_touch_pad_visible(bool visible) {
      if (!open_ || !impl_) return;
      auto* b = static_cast<Backend*>(impl_);
      visible = visible && b->touch_controls;
@@ -1988,7 +2042,7 @@ index 496d741..4d1aa87 100644
      // Any finger currently on a pad button is released with the pad.
      for (auto& t : b->touches)
          if (t.active && t.pad) t.buttons = 0;
-@@ -3011,7 +3229,7 @@ HostWindow::Events HostWindow::pump() {
+@@ -3011,7 +3266,7 @@ HostWindow::Events HostWindow::pump() {
              ImGui::SetCurrentContext(b->runtime_imgui_context);
              ImGui_ImplSDL2_ProcessEvent(&e);
          }
@@ -1997,7 +2051,7 @@ index 496d741..4d1aa87 100644
  #endif
          if (e.type == SDL_QUIT) {
              ev.quit = true;
-@@ -3025,12 +3243,17 @@ HostWindow::Events HostWindow::pump() {
+@@ -3025,12 +3280,17 @@ HostWindow::Events HostWindow::pump() {
              ev.terminating = true;
              ev.quit = true;
          } else if (e.type == SDL_CONTROLLERDEVICEADDED) {
@@ -2016,7 +2070,7 @@ index 496d741..4d1aa87 100644
              }
          } else if (e.type == SDL_WINDOWEVENT &&
                     e.window.event == SDL_WINDOWEVENT_CLOSE) {
-@@ -3225,25 +3448,70 @@ HostWindow::Events HostWindow::pump() {
+@@ -3225,25 +3485,70 @@ HostWindow::Events HostWindow::pump() {
      // inputs. Keyboard and controller are additive so either can be used at
      // any time, including while testing motion.
      if (b->controller && SDL_GameControllerGetAttached(b->controller)) {
@@ -2066,7 +2120,7 @@ index 496d741..4d1aa87 100644
 +            }
 +            if (assist_pad_down(b->controller, binding))
 +                keys &= static_cast<uint16_t>(~(1u << bits[row]));
-         }
++        }
 +#else
 +        constexpr int buttons[] = {0, 1, 4, 6, 14, 13, 11, 12, 10, 9};
 +        for (int bit = 0; bit < 10; ++bit)
@@ -2092,7 +2146,7 @@ index 496d741..4d1aa87 100644
 +        if (SDL_GameControllerGetAxis(b->controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 8000) {
 +            keys &= static_cast<uint16_t>(~(1u << 8));
 +            keys &= static_cast<uint16_t>(~(1u << 1));
-+        }
+         }
 +
 +        // Left Analog Thumbstick -> D-Pad movement
 +        const int16_t stick_x = SDL_GameControllerGetAxis(b->controller, SDL_CONTROLLER_AXIS_LEFTX);
@@ -2105,15 +2159,18 @@ index 496d741..4d1aa87 100644
      }
      if (b->touch_controls) {
          const uint16_t touch_buttons = active_touch_buttons(b);
-@@ -3369,6 +3637,7 @@ bool HostWindow::drawable_size(int* /*width*/, int* /*height*/) const {
+@@ -3369,6 +3674,10 @@ bool HostWindow::drawable_size(int* /*width*/, int* /*height*/) const {
  
  void HostWindow::present(const uint8_t* /*rgb888*/) {}
  void HostWindow::present(const uint8_t*, unsigned, unsigned) {}
 +void HostWindow::present_scaled(const uint8_t*, int) {}
++bool HostWindow::display_timing(std::chrono::nanoseconds*, std::chrono::steady_clock::time_point*) const {
++    return false;
++}
  
  void HostWindow::load_input_config(const char* /*dir*/,
                                     bool /*assist_tools_default*/,
-@@ -3381,13 +3650,19 @@ int  HostWindow::volume() const { return 100; }
+@@ -3381,13 +3690,19 @@ int  HostWindow::volume() const { return 100; }
  int  HostWindow::window_scale() const { return 1; }
  void HostWindow::set_linear_filter(bool /*enabled*/) {}
  bool HostWindow::linear_filter() const { return false; }
@@ -2134,10 +2191,18 @@ index 496d741..4d1aa87 100644
  void HostWindow::configure_touch(bool /*policy*/, std::uint32_t /*claims*/,
                                   int /*pad_default*/, bool /*emulate_touch*/) {}
 diff --git a/src/runtime/host_window.h b/src/runtime/host_window.h
-index 073ef16..7d9b581 100644
+index 073ef16..b84109e 100644
 --- a/src/runtime/host_window.h
 +++ b/src/runtime/host_window.h
-@@ -103,13 +103,25 @@ public:
+@@ -23,6 +23,7 @@
+ 
+ #pragma once
+ 
++#include <chrono>
+ #include <cstddef>
+ #include <cstdint>
+ 
+@@ -103,13 +104,25 @@ public:
      // false until the player has chosen.
      bool saved_audio_enhanced(bool& enabled) const;
      void save_audio_enhanced(bool enabled);
@@ -2163,7 +2228,7 @@ index 073ef16..7d9b581 100644
  #endif
      // ---- touch (touch_input.h) ---------------------------------------------
      // `policy` = the game consumes touch through RunOptions::input_frame;
-@@ -159,6 +171,10 @@ public:
+@@ -159,6 +172,15 @@ public:
      // The enhanced texture is uploaded and presented directly, without a
      // native-resolution intermediate render target.
      void present(const uint8_t* rgb888, unsigned width, unsigned height);
@@ -2171,14 +2236,19 @@ index 073ef16..7d9b581 100644
 +    // same destination; smooth motion's interpolated frames use 2 for
 +    // half-pixel motion.
 +    void present_scaled(const uint8_t* rgb888, int factor);
++    // Refresh period of the window's display, and (Windows compositor only)
++    // when its latest vblank was; `vblank` is left alone when unknown.
++    // Returns false when the period is unknown.
++    bool display_timing(std::chrono::nanoseconds* period,
++                        std::chrono::steady_clock::time_point* vblank) const;
  
      // Push `count` int16_t mono samples assuming the engine's 65.536 kHz
      // source rate. Prefer push_audio_block when the caller knows the real
 diff --git a/src/runtime/host_window_web.cpp b/src/runtime/host_window_web.cpp
-index cdd53be..dad0d23 100644
+index cdd53be..03716a3 100644
 --- a/src/runtime/host_window_web.cpp
 +++ b/src/runtime/host_window_web.cpp
-@@ -317,6 +317,14 @@ void HostWindow::close() {
+@@ -317,6 +317,17 @@ void HostWindow::close() {
  }
  bool HostWindow::set_surface_size(int w,int h) { if(!impl_||!dimensions(w,h))return false; backend(impl_)->width=w;backend(impl_)->height=h;return true; }
  bool HostWindow::drawable_size(int* w,int* h) const { if(!impl_||!w||!h)return false; auto d=backend(impl_)->shared.control.drawable.load(); *w=d&65535;*h=d>>16;return *w&&*h; }
@@ -2186,6 +2256,9 @@ index cdd53be..dad0d23 100644
 +// skipped and native frames go through present().
 +void HostWindow::present_scaled(const uint8_t* rgb, int factor) {
 +    if (factor == 1) present(rgb);
++}
++bool HostWindow::display_timing(std::chrono::nanoseconds*, std::chrono::steady_clock::time_point*) const {
++    return false;
 +}
 +void HostWindow::set_fill_display(bool) {}
 +bool HostWindow::fill_display() const { return false; }
@@ -2328,7 +2401,7 @@ index 266c987..010c5ae 100644
      }
  };
 diff --git a/src/runtime/runtime.cpp b/src/runtime/runtime.cpp
-index 1eb5011..2377d9c 100644
+index 1eb5011..5f00fac 100644
 --- a/src/runtime/runtime.cpp
 +++ b/src/runtime/runtime.cpp
 @@ -197,6 +197,9 @@ struct Args {
@@ -2414,6 +2487,15 @@ index 1eb5011..2377d9c 100644
      std::fprintf(stderr, "cpu_backend=%s\n",
                   g_force_interp ? "interpreter (GBARECOMP_FORCE_INTERP)"
                                  : "static-recompiled");
+@@ -1918,7 +1943,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+         bus.audio().shadow_hook_pcs(g_runtime_observed_pcs,
+                                     RUNTIME_MAX_OBSERVED_PCS));
+     g_runtime_dispatch_observer = g_runtime_observed_pc_count
+-        ? [](uint32_t pc, int thumb) {
++        ? +[](uint32_t pc, int thumb) {  // + : GCC 11 won't pick a common type with nullptr
+               if (gba::GbaBus* b = gbarecomp::active_bus())
+                   b->audio().shadow_driver_tick(pc, thumb != 0);
+           }
 @@ -2293,6 +2318,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
              uint32_t n = runtime_swi_log_save_file(sl);
              std::printf("swi_log_saved path=\"%s\" records=%u\n", sl, n);
@@ -2484,7 +2566,7 @@ index 1eb5011..2377d9c 100644
      // ── HP-002 frame-phase ring ─────────────────────────────────────────
      // Opt-in per-presented-frame breakdown of where wall time went
      // between consecutive presents: guest execution, view-sync + render/
-@@ -2992,13 +3036,33 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -2992,13 +3036,74 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
      };
      FramePhaseRing frame_phase;
      uint64_t high_resolution_presented = 0;
@@ -2495,9 +2577,55 @@ index 1eb5011..2377d9c 100644
 +    std::optional<FramePacer> pacer;
 +    bool fast_forward_active = false;
 +    // Smooth motion: a game that installs gba::g_present_interpolator gets an
-+    // interpolated frame presented half a period before each paced real one.
++    // interpolated frame on every display refresh between its real frames.
 +    // Native presentation only; the high-resolution surface is presented as is.
 +    std::vector<uint8_t> interpolated_fb;
++    // One present per display refresh, early in the refresh before the one it
++    // is for, so each lands in its own refresh. It shows the moment that far
++    // from the previous frame (fully shown at smooth_origin()) to this one. A
++    // refresh whose present would fall after the next frame's deadline, or
++    // that needs the next frame, is left for the next call.
++    std::chrono::steady_clock::time_point smooth_slot{};  // next refresh not yet presented
++    bool smooth_on = false;                               // the game's last answer
++    auto present_smooth = [&]() -> bool {
++        using clock = std::chrono::steady_clock;
++        const auto frame = pacer->period();
++        const clock::time_point origin = pacer->smooth_origin();
++        const clock::time_point deadline = pacer->frame_start() + frame;
++        interpolated_fb.resize(ppu.render_bytes() * 4u);
++        const uint32_t w = ppu.render_width(), h = ppu.render_height();
++        if (!smooth_on && !(smooth_on = gba::g_present_interpolator(&ppu, live_fb.data(), w, h,
++                                                                    interpolated_fb.data(), 0.5f) != 0))
++            return false;
++        std::chrono::nanoseconds refresh{};
++        clock::time_point vblank{};
++        if (!win.display_timing(&refresh, &vblank) || refresh < std::chrono::milliseconds(2))
++            refresh = frame / 2;
++        const clock::time_point now = clock::now();
++        if (vblank == clock::time_point{}) vblank = smooth_slot != clock::time_point{} ? smooth_slot : now;
++        clock::time_point slot = vblank + ((std::max(smooth_slot, now) - vblank) / refresh) * refresh;
++        while (slot <= now || slot < smooth_slot - refresh / 2) slot += refresh;
++        constexpr auto kEarly = std::chrono::milliseconds(1);
++        for (;; slot += refresh) {
++            const clock::time_point at = std::max(slot - refresh + kEarly, clock::now());
++            if (at > deadline || slot > origin + frame) break;
++            pacer->sleep_until(at);
++            if (clock::now() >= slot) continue;  // missed this refresh
++            const float t = std::chrono::duration<float>(slot - origin) / std::chrono::duration<float>(frame);
++            if (t >= 0.999f) {
++                win.present(live_fb.data());
++            } else if (gba::g_present_interpolator(&ppu, live_fb.data(), w, h, interpolated_fb.data(),
++                                                   std::max(t, 0.0f))) {
++                win.present_scaled(interpolated_fb.data(), 2);
++            } else {
++                smooth_on = false;
++                win.present(live_fb.data());
++                break;
++            }
++        }
++        smooth_slot = slot;
++        return true;
++    };
      auto present_live_frame = [&]() {
          ppu.set_internal_resolution(args.internal_resolution, opts.high_resolution_affine_provider);
          if (const auto* pixels = ppu.high_resolution_framebuffer()) {
@@ -2507,19 +2635,14 @@ index 1eb5011..2377d9c 100644
 -        } else win.present(live_fb.data());
 +            return;
 +        }
-+        if (gba::g_present_interpolator && pacer && !pacer->uncapped() && !fast_forward_active) {
-+            interpolated_fb.resize(ppu.render_bytes() * 4u);
-+            if (gba::g_present_interpolator(&ppu, live_fb.data(), ppu.render_width(),
-+                                            ppu.render_height(), interpolated_fb.data())) {
-+                win.present_scaled(interpolated_fb.data(), 2);
-+                pacer->wait_half_frame();
-+            }
-+        }
++        if (gba::g_present_interpolator && pacer && !pacer->uncapped() && !fast_forward_active &&
++            present_smooth())
++            return;
 +        win.present(live_fb.data());
      };
      auto apply_runtime_view_geometry = [&](ViewGeometry geometry) -> bool {
          if (opts.view_geometry) opts.view_geometry(&geometry, 0, 0);
-@@ -3089,10 +3153,6 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -3089,10 +3194,6 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
          }
          return true;
      };
@@ -2530,7 +2653,7 @@ index 1eb5011..2377d9c 100644
      // Windowed observe-mode TCP (see Args::tcp_observe_port). Savestate
      // requests from its thread are executed by the main loop at the next
      // present, the only point where machine state is consistent.
-@@ -3182,6 +3242,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -3182,6 +3283,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
              win.configure_touch(opts.input_frame != nullptr,
                                  opts.touch_gesture_claims,
                                  opts.touch_pad_default, args.touch_emulation);
@@ -2538,7 +2661,7 @@ index 1eb5011..2377d9c 100644
              win.set_touch_config_dir(exe_dir.c_str());
              // The player's menu choice wins over [audio].shadow;
              // GBARECOMP_AUDIO_SHADOW still overrides both.
-@@ -3232,6 +3293,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -3232,6 +3334,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
          }
          if (args.fullscreen) win.set_fullscreen(args.fullscreen);
          win.set_volume(args.volume);
@@ -2546,7 +2669,7 @@ index 1eb5011..2377d9c 100644
          win.set_fps_readout(opts.show_fps_by_default);
  #if defined(GBARECOMP_RUNTIME_UI)
          runtime_ui_context.window = &win;
-@@ -3263,7 +3325,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -3263,7 +3366,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
          RecompRuntimeUiStandardConfig runtime_ui_config{};
          runtime_ui_config.menu.title = runtime_title;
          runtime_ui_config.menu.subtitle = "Game Boy Advance runtime settings";
@@ -2555,7 +2678,7 @@ index 1eb5011..2377d9c 100644
  #if defined(RECOMP_RUNTIME_UI_HAS_PRESENTATION_FLAGS)
          if (opts.ui_touch_friendly) {
              runtime_ui_config.menu.presentation_flags |=
-@@ -3308,15 +3370,16 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -3308,15 +3411,16 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                  RECOMP_RUNTIME_UI_STANDARD_SAVE_STATE |
                  RECOMP_RUNTIME_UI_STANDARD_LOAD_STATE;
          }
@@ -2575,7 +2698,7 @@ index 1eb5011..2377d9c 100644
          // A mobile game has no window to close and the system Back button is
          // routed to the game, so the menu is the only clean way out: it ends
          // the session (save flushed, no suspend state) and the Activity
-@@ -3446,6 +3509,32 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -3446,6 +3550,32 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
          fps_item.type        = RECOMP_RUNTIME_UI_BOOL;
          runtime_ui_extras.push_back(fps_item);
  
@@ -2608,7 +2731,7 @@ index 1eb5011..2377d9c 100644
          if (opts.ui_extra_items && opts.ui_extra_item_count) {
              const auto* game_items =
                  static_cast<const RecompRuntimeUiItem*>(opts.ui_extra_items);
-@@ -3458,6 +3547,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -3458,6 +3588,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
          runtime_ui_context.ui =
              recomp_runtime_ui_create_standard(&runtime_ui_config);
          win.set_runtime_ui(runtime_ui_context.ui);
@@ -2616,7 +2739,7 @@ index 1eb5011..2377d9c 100644
  #endif
          sync_resize_driven_view();
          if (live_fb.empty()) live_fb.assign(ppu.render_bytes(), 0);
-@@ -3533,7 +3623,6 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -3533,7 +3664,6 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
          return !opts.expose_assist_tools || win.assist_tools_enabled();
  #endif
      };
@@ -2624,7 +2747,7 @@ index 1eb5011..2377d9c 100644
      int fast_forward_multiplier = std::clamp(
          win.fast_forward_multiplier(), 2, 10);
      auto capture_rewind_point = [&]() {
-@@ -4904,6 +4993,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -4904,6 +5034,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                  if (present_frame) present_live_frame();
                  // Framedump (capture runs only) is attributed to present_us.
                  if (framedump_dir && frame >= framedump_start &&

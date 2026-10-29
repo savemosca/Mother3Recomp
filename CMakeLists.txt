@@ -120,11 +120,6 @@ else()
         "-Wl,--end-group")
 endif()
 
-option(MOTHER3_TUNE_RG556 "Anbernic RG556 preset: OpenSL ES, smaller audio cushion, big cores" OFF)
-if(MOTHER3_TUNE_RG556)
-    target_compile_definitions(${MOTHER3_TARGET} PRIVATE MOTHER3_TUNE_RG556)
-endif()
-
 # RetroAchievements (softcore) for Android: rcheevos checked out at
 # third_party/rcheevos by tools/setup_deps.py (pinned in dependencies.lock.json).
 set(RCHEEVOS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rcheevos"
@@ -156,6 +151,11 @@ if(ANDROID AND MOTHER3_RETROACHIEVEMENTS)
         message(WARNING "rcheevos not found at ${RCHEEVOS_ROOT}; "
             "building without RetroAchievements (run tools/setup_deps.py).")
     endif()
+endif()
+
+option(MOTHER3_TUNE_RG556 "Anbernic RG556 preset: OpenSL ES, smaller audio cushion, big cores" OFF)
+if(MOTHER3_TUNE_RG556)
+    target_compile_definitions(${MOTHER3_TARGET} PRIVATE MOTHER3_TUNE_RG556)
 endif()
 
 target_compile_definitions(${MOTHER3_TARGET} PRIVATE
@@ -204,7 +204,8 @@ endif()
 if(WIN32)
     enable_language(RC)
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/mother3_icon.rc"
-        "1 ICON \"${CMAKE_CURRENT_SOURCE_DIR}/Mother 3.ico\"\n")
+        "1 ICON \"${CMAKE_CURRENT_SOURCE_DIR}/Mother 3.ico\"\n"
+        "1 24 \"${CMAKE_CURRENT_SOURCE_DIR}/src/mother3.manifest\"\n")
     target_sources(${MOTHER3_TARGET} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/mother3_icon.rc")
     add_library(mother3_bezel SHARED interposer/mother3_bezel.c)
     set_target_properties(mother3_bezel PROPERTIES PREFIX "")
