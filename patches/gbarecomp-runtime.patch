@@ -770,22 +770,26 @@ index 38ee8b9..e76c453 100644
          <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
      </style>
 diff --git a/src/debug/snapshot.cpp b/src/debug/snapshot.cpp
-index fcf05bd..5e88723 100644
+index bd2b855..b39eabd 100644
 --- a/src/debug/snapshot.cpp
 +++ b/src/debug/snapshot.cpp
-@@ -35,6 +35,11 @@ namespace {
+@@ -35,6 +35,15 @@ namespace gbarecomp::debug {
+ namespace {
  
  constexpr char kMagic[4] = {'G', 'B', 'A', 'S'};
- constexpr uint32_t kLegacySnapshotVersion = 1;
 +// Version 2 predates the SWI continuations at the end of the CPU section
 +// (d4c88e6); its sections are otherwise the same. It loads with no
 +// continuation pending, as version-2 runtimes restored it, so suspend states
 +// and save slots survive the engine update.
 +constexpr uint32_t kSwiLessSnapshotVersion = 2;
++// Versions 2 and 4 predate the TIME section and PSG channels 3/4 in AUDIO
++// (v5). They load as those runtimes restored them: pending device timing
++// starts afresh and channels 3/4 reset, so suspend states survive the update.
++constexpr uint32_t kPreTimingSnapshotVersion = 4;
  
  // FourCC section tags.
  constexpr uint32_t fourcc(char a, char b, char c, char d) {
-@@ -87,14 +92,14 @@ void serialize_cpu(SnapshotWriter& w) {
+@@ -88,14 +97,14 @@ void serialize_cpu(SnapshotWriter& w) {
      for (const auto& slot : swi) { w.u32(slot.continuation); w.u32(slot.return_pc); }
  }
  
@@ -802,16 +806,62 @@ index fcf05bd..5e88723 100644
      if (!r.ok() || count > kRuntimeSwiLimit || count > r.remaining() / 8u) return false;
      std::vector<RuntimeSwiContinuation> swi(count);
      for (auto& slot : swi) { slot.continuation = r.u32(); slot.return_pc = r.u32(); }
-@@ -221,7 +226,7 @@ bool load_state_bytes(const uint8_t* data, std::size_t size,
+@@ -225,7 +234,8 @@ bool load_state_bytes(const uint8_t* data, std::size_t size,
          return false;
      }
      uint32_t version = head.u32();
 -    if (version != kSnapshotVersion) {
-+    if (version != kSnapshotVersion && version != kSwiLessSnapshotVersion) {
++    if (version != kSnapshotVersion && version != kSwiLessSnapshotVersion &&
++        version != kPreTimingSnapshotVersion) {
          if (err) {
              *err = "snapshot: version mismatch (file v" +
                     std::to_string(version) + ", runtime v" +
-@@ -346,12 +351,12 @@ bool load_state_bytes(const uint8_t* data, std::size_t size,
+@@ -288,14 +298,22 @@ bool load_state_bytes(const uint8_t* data, std::size_t size,
+     }
+ 
+     // All gameplay-relevant sections must be present. META is advisory.
++    const bool pre_timing = version < kSnapshotVersion;
+     const uint32_t required[] = {TAG_CPU, TAG_BUS, TAG_IO,
+                                  TAG_AUDIO, TAG_SAVE, TAG_PPU, TAG_TIME};
+     for (uint32_t tag : required) {
++        if (tag == TAG_TIME && pre_timing) continue;
+         if (sections.find(tag) == sections.end()) {
+             if (err) *err = "snapshot: missing required section";
+             return false;
+         }
+     }
++    // An older version number on a newer layout (or the reverse) is refused
++    // rather than read with the wrong one.
++    if (pre_timing && sections.find(TAG_TIME) != sections.end()) {
++        if (err) *err = "snapshot: v" + std::to_string(version) + " file with a timing section";
++        return false;
++    }
+ 
+     // MODS preflight happens after the immutable container/header checks, but
+     // before CPU, bus, device, or provider restoration.  Thus a provider
+@@ -324,8 +342,20 @@ bool load_state_bytes(const uint8_t* data, std::size_t size,
+         return SnapshotReader(base, len);
+     };
+ 
+-    RuntimeTimingContext timing;
++    // The audio section has no length of its own to check, so parse it into
++    // a scratch mixer first: it must end exactly where the section does.
+     {
++        SnapshotReader r = reader_for(TAG_AUDIO);
++        gba::GbaAudio probe;
++        probe.deserialize(r, !pre_timing);
++        if (!r.ok() || r.remaining() != 0) {
++            if (err) *err = "snapshot: audio section does not match its version";
++            return false;
++        }
++    }
++
++    RuntimeTimingContext timing;
++    if (!pre_timing) {
+         if (sections.at(TAG_TIME).len != 40) {
+             if (err) *err = "snapshot: invalid timing section size";
+             return false;
+@@ -342,17 +372,17 @@ bool load_state_bytes(const uint8_t* data, std::size_t size,
  
      {
          SnapshotReader r = reader_for(TAG_CPU);
@@ -826,6 +876,121 @@ index fcf05bd..5e88723 100644
      { SnapshotReader r = reader_for(TAG_BUS);   ctx.bus->deserialize(r); }
      { SnapshotReader r = reader_for(TAG_IO);    ctx.bus->io().deserialize(r); }
      // WAITCNT arrived with the IO page; re-derive the bus wait-state table.
+     ctx.bus->refresh_waitstates();
+-    { SnapshotReader r = reader_for(TAG_AUDIO); ctx.bus->audio().deserialize(r); }
++    { SnapshotReader r = reader_for(TAG_AUDIO); ctx.bus->audio().deserialize(r, !pre_timing); }
+     { SnapshotReader r = reader_for(TAG_SAVE);  ctx.bus->save().deserialize(r); }
+     { SnapshotReader r = reader_for(TAG_PPU);   ctx.ppu->deserialize(r); }
+     if (sections.find(TAG_META) != sections.end()) {
+@@ -366,7 +396,7 @@ bool load_state_bytes(const uint8_t* data, std::size_t size,
+         // live, so continuing after a provider violation would be unsafe.
+         if (!ctx.mod_state->restore(mods_reader, err)) std::abort();
+     }
+-    runtime_restore_timing_context(timing);
++    if (!pre_timing) runtime_restore_timing_context(timing);
+ 
+     return true;
+ }
+diff --git a/src/gba/gba_audio.cpp b/src/gba/gba_audio.cpp
+index 0c9a865..5799544 100644
+--- a/src/gba/gba_audio.cpp
++++ b/src/gba/gba_audio.cpp
+@@ -44,14 +44,16 @@ GbaAudio::GbaAudio() {
+ }
+ GbaAudio::~GbaAudio() = default;
+ 
+-void GbaAudio::serialize(gbarecomp::debug::SnapshotWriter& w) const {
++void GbaAudio::serialize(gbarecomp::debug::SnapshotWriter& w, bool with_psg34) const {
+     // Channels + FIFOs are POD nested structs (no pointers); raw bytes
+     // are stable within a build and the snapshot version gates layout.
+     w.bytes(&ch1_, sizeof(ch1_));
+     w.bytes(&ch2_, sizeof(ch2_));
+-    w.bytes(&ch3_, sizeof(ch3_));
+-    w.bytes(&ch4_, sizeof(ch4_));
+-    w.bytes(wave_ram_, sizeof(wave_ram_));
++    if (with_psg34) {
++        w.bytes(&ch3_, sizeof(ch3_));
++        w.bytes(&ch4_, sizeof(ch4_));
++        w.bytes(wave_ram_, sizeof(wave_ram_));
++    }
+     w.boolean(master_enable_);
+     w.u8(volume_l_);
+     w.u8(volume_r_);
+@@ -59,10 +61,12 @@ void GbaAudio::serialize(gbarecomp::debug::SnapshotWriter& w) const {
+     w.boolean(ch1_right_enable_);
+     w.boolean(ch2_left_enable_);
+     w.boolean(ch2_right_enable_);
+-    w.boolean(ch3_left_enable_);
+-    w.boolean(ch3_right_enable_);
+-    w.boolean(ch4_left_enable_);
+-    w.boolean(ch4_right_enable_);
++    if (with_psg34) {
++        w.boolean(ch3_left_enable_);
++        w.boolean(ch3_right_enable_);
++        w.boolean(ch4_left_enable_);
++        w.boolean(ch4_right_enable_);
++    }
+     w.u8(dmg_volume_ratio_);
+     w.bytes(&fifo_a_, sizeof(fifo_a_));
+     w.bytes(&fifo_b_, sizeof(fifo_b_));
+@@ -87,12 +91,18 @@ void GbaAudio::serialize(gbarecomp::debug::SnapshotWriter& w) const {
+     w.u32(sample_index_);
+ }
+ 
+-void GbaAudio::deserialize(gbarecomp::debug::SnapshotReader& r) {
++void GbaAudio::deserialize(gbarecomp::debug::SnapshotReader& r, bool with_psg34) {
+     r.bytes(&ch1_, sizeof(ch1_));
+     r.bytes(&ch2_, sizeof(ch2_));
+-    r.bytes(&ch3_, sizeof(ch3_));
+-    r.bytes(&ch4_, sizeof(ch4_));
+-    r.bytes(wave_ram_, sizeof(wave_ram_));
++    if (with_psg34) {
++        r.bytes(&ch3_, sizeof(ch3_));
++        r.bytes(&ch4_, sizeof(ch4_));
++        r.bytes(wave_ram_, sizeof(wave_ram_));
++    } else {
++        ch3_ = Sound3{};
++        ch4_ = Sound4{};
++        std::fill(std::begin(wave_ram_), std::end(wave_ram_), uint8_t{0});
++    }
+     master_enable_    = r.boolean();
+     volume_l_         = r.u8();
+     volume_r_         = r.u8();
+@@ -100,10 +110,12 @@ void GbaAudio::deserialize(gbarecomp::debug::SnapshotReader& r) {
+     ch1_right_enable_ = r.boolean();
+     ch2_left_enable_  = r.boolean();
+     ch2_right_enable_ = r.boolean();
+-    ch3_left_enable_ = r.boolean();
+-    ch3_right_enable_ = r.boolean();
+-    ch4_left_enable_ = r.boolean();
+-    ch4_right_enable_ = r.boolean();
++    if (with_psg34) {
++        ch3_left_enable_ = r.boolean();
++        ch3_right_enable_ = r.boolean();
++        ch4_left_enable_ = r.boolean();
++        ch4_right_enable_ = r.boolean();
++    }
+     dmg_volume_ratio_ = r.u8();
+     r.bytes(&fifo_a_, sizeof(fifo_a_));
+     r.bytes(&fifo_b_, sizeof(fifo_b_));
+diff --git a/src/gba/gba_audio.h b/src/gba/gba_audio.h
+index 3835086..f47a987 100644
+--- a/src/gba/gba_audio.h
++++ b/src/gba/gba_audio.h
+@@ -178,8 +178,11 @@ public:
+     // (channels, FIFOs, master, soundbias, sample accumulator) plus the
+     // pending host output ring so playback resumes seamlessly. The
+     // diagnostic FIFO trace ring is NOT serialized. See debug/snapshot.h.
+-    void serialize(gbarecomp::debug::SnapshotWriter& w) const;
+-    void deserialize(gbarecomp::debug::SnapshotReader& r);
++    // with_psg34 = false is the layout before snapshot v5: PSG channels 3
++    // and 4, wave RAM and their panning were not saved, and load reset them
++    // (the driver re-triggers them within a frame).
++    void serialize(gbarecomp::debug::SnapshotWriter& w, bool with_psg34 = true) const;
++    void deserialize(gbarecomp::debug::SnapshotReader& r, bool with_psg34 = true);
+ 
+ private:
+     friend class SimulationStateCodec;
 diff --git a/src/gba/gba_io.cpp b/src/gba/gba_io.cpp
 index 9028a02..ee94d6f 100644
 --- a/src/gba/gba_io.cpp
@@ -900,7 +1065,7 @@ index 53ba221..73449b9 100644
          return static_cast<uint16_t>(host_keyinput_ & synth_keyinput_ & 0x03FFu);
      }
 diff --git a/src/gba/gba_ppu.cpp b/src/gba/gba_ppu.cpp
-index 0454527..9c7aa75 100644
+index ebb0cb2..fb46cc5 100644
 --- a/src/gba/gba_ppu.cpp
 +++ b/src/gba/gba_ppu.cpp
 @@ -33,6 +33,8 @@ extern "C" int g_ws_affine_filter_enabled = 0;
@@ -1006,7 +1171,7 @@ index 0454527..9c7aa75 100644
  
      struct PixelCandidate {
  #if !defined(GBARECOMP_SCANLINE_HLE)
-@@ -2075,6 +2103,7 @@ void render_scanline_wide(uint8_t* rgb, int y, uint16_t dispcnt,
+@@ -2127,6 +2155,7 @@ void render_scanline_wide(uint8_t* rgb, int y, uint16_t dispcnt,
              g_ws_ui_pixel_provider(static_cast<int>(x) - static_cast<int>(ox), y, &ui_color))
              submit(x, ui_color & 0x7FFFu, -1, 0, false, false);
          uint8_t* dst = row + x * 3;
@@ -1014,7 +1179,7 @@ index 0454527..9c7aa75 100644
          // OBJ-only presentations (notably the real GBA BIOS logo) author the
          // whole backdrop through palette entry 0. There is no regular-BG
          // alias to protect in the margins, so preserve that authentic color
-@@ -2142,8 +2171,9 @@ void GbaPpu::render(uint8_t* rgb,
+@@ -2194,8 +2223,9 @@ void GbaPpu::render(uint8_t* rgb,
          return;
      }
      const uint32_t ow = render_width();
@@ -1026,7 +1191,7 @@ index 0454527..9c7aa75 100644
      }
  }
  
-@@ -2446,18 +2476,39 @@ void GbaPpu::render_scanline(uint32_t y,
+@@ -2498,18 +2528,39 @@ void GbaPpu::render_scanline(uint32_t y,
      }
  
      if (!rasterization_enabled_) return;
@@ -1067,7 +1232,7 @@ index 0454527..9c7aa75 100644
          if (hd_line) {
              // The expanded compositor may apply optional presentation filters.
              // Keep its native scratch entirely separate from canonical pixels.
-@@ -2466,21 +2517,28 @@ void GbaPpu::render_scanline(uint32_t y,
+@@ -2518,21 +2569,28 @@ void GbaPpu::render_scanline(uint32_t y,
          } else if (hd) hd->upscale_line(y, work_fb_.data() + y * render_width() * 3);
          return;
      }
@@ -1108,7 +1273,7 @@ index 0454527..9c7aa75 100644
  }
  
  void GbaPpu::note_affine_reference_write(unsigned bg, bool y_axis) {
-@@ -2510,6 +2568,12 @@ void GbaPpu::latch_framebuffer(uint16_t dispcnt,
+@@ -2562,6 +2620,12 @@ void GbaPpu::latch_framebuffer(uint16_t dispcnt,
  void GbaPpu::mark_framebuffer_latched() {
      if (rasterization_enabled_)
          std::memcpy(latched_fb_.data(), work_fb_.data(), render_bytes());
@@ -1368,7 +1533,7 @@ index 42208db..10b3158 100644
      bool raised_timer_res_ = false;
      // HP-002: Windows high-resolution waitable timer (HANDLE, void* here to
 diff --git a/src/runtime/host_window.cpp b/src/runtime/host_window.cpp
-index 496d741..349f4b0 100644
+index 418729d..a2e8b90 100644
 --- a/src/runtime/host_window.cpp
 +++ b/src/runtime/host_window.cpp
 @@ -23,6 +23,7 @@
@@ -1410,7 +1575,7 @@ index 496d741..349f4b0 100644
  }  // namespace
  extern "C" JNIEXPORT void JNICALL
  Java_org_gbarecomp_GbaNative_setSafeInsets(JNIEnv*, jclass, jint left, jint top,
-@@ -347,6 +372,7 @@ struct Backend {
+@@ -349,6 +374,7 @@ struct Backend {
      unsigned      presentation_source_w = 0, presentation_source_h = 0;
      std::vector<uint8_t> presentation_upload;
      SDL_Texture*  sharp_texture = nullptr;
@@ -1418,7 +1583,7 @@ index 496d741..349f4b0 100644
      int           sharp_texture_w = 0;
      int           sharp_texture_h = 0;
      bool          sharp_target_failed = false;
-@@ -376,6 +402,9 @@ struct Backend {
+@@ -378,6 +404,9 @@ struct Backend {
      // GBARECOMP_TOUCH_CONTROLS) and its player-controlled visibility.
      bool touch_controls = false;
      bool pad_visible = false;
@@ -1428,7 +1593,7 @@ index 496d741..349f4b0 100644
      bool pad_choice_saved = false;
      // Player-placed pad toggle: centre as a fraction of the safe area, so it
      // keeps its place across rotation. Unset = bottom-right corner.
-@@ -388,6 +417,9 @@ struct Backend {
+@@ -390,6 +419,9 @@ struct Backend {
      // Enhanced (MP2K shadow) audio; saved = the player chose it in the menu.
      bool audio_enhanced = false;
      bool audio_enhanced_saved = false;
@@ -1438,7 +1603,7 @@ index 496d741..349f4b0 100644
      bool touch_emulation = false;   // desktop mouse -> touch
      float px_per_mm = 96.0f / 25.4f;
      float logical_px_per_mm = 96.0f / 25.4f;  // SDL-reported (logical) density
-@@ -452,6 +484,7 @@ struct Backend {
+@@ -454,6 +486,7 @@ struct Backend {
      // grading), so default behavior is byte-identical to upstream.
      std::unique_ptr<runtime::ColorLut> color_lut;
      std::vector<uint8_t> graded_fb;  // scratch RGB888 (base_w*base_h*3)
@@ -1446,7 +1611,7 @@ index 496d741..349f4b0 100644
  #if defined(GBARECOMP_RUNTIME_UI)
      RecompRuntimeUi* runtime_ui = nullptr;
      ImGuiContext* runtime_imgui_context = nullptr;
-@@ -466,6 +499,8 @@ struct Backend {
+@@ -468,6 +501,8 @@ struct Backend {
      int base_h = 160;   // logical surface height (160; vertical expansion deferred)
      bool expanded_view = false;  // native games retain the historical SDL path
      bool resize_driven_view = false;
@@ -1455,7 +1620,7 @@ index 496d741..349f4b0 100644
      bool freely_resizable_window = false;
      bool linear_filter = false;
      bool sharp_filter = false;
-@@ -473,14 +508,15 @@ struct Backend {
+@@ -475,14 +510,15 @@ struct Backend {
      // ---- rebindable input (see HostWindow::load_input_config) --------------
      // GBA KEYINPUT bit (0..9) per bound SDL scancode; seeded from the
      // built-in defaults, overridden by keybinds.ini [player1].
@@ -1473,7 +1638,7 @@ index 496d741..349f4b0 100644
      };
      bool         assist_tools = true;
      int          assist_fast_forward_multiplier = 4;
-@@ -557,6 +593,41 @@ bool ensure_sharp_texture(Backend* b, int factor) {
+@@ -559,6 +595,41 @@ bool ensure_sharp_texture(Backend* b, int factor) {
      return true;
  }
  
@@ -1515,7 +1680,7 @@ index 496d741..349f4b0 100644
  void close_game_controller(Backend* b) {
      if (!b || !b->controller) return;
  #if SDL_VERSION_ATLEAST(2, 0, 14)
-@@ -575,6 +646,11 @@ bool open_game_controller(Backend* b, int device_index) {
+@@ -577,6 +648,11 @@ bool open_game_controller(Backend* b, int device_index) {
          !SDL_IsGameController(device_index))
          return false;
  
@@ -1527,7 +1692,7 @@ index 496d741..349f4b0 100644
      SDL_GameController* controller = SDL_GameControllerOpen(device_index);
      if (!controller) return false;
      b->controller = controller;
-@@ -1141,6 +1217,7 @@ void save_touch_config(const Backend* b) {
+@@ -1143,6 +1219,7 @@ void save_touch_config(const Backend* b) {
              const bool header = s != std::string::npos && line[s] == '[';
              if (header)
                  in_section = line.compare(s, 7, "[Touch]") == 0 ||
@@ -1535,7 +1700,7 @@ index 496d741..349f4b0 100644
                               line.compare(s, 7, "[Audio]") == 0;
              if (in_section) continue;
              kept.push_back(line);
-@@ -1153,11 +1230,15 @@ void save_touch_config(const Backend* b) {
+@@ -1155,11 +1232,15 @@ void save_touch_config(const Backend* b) {
      if (!kept.empty()) f << "\n";
      f << "[Touch]\n";
      if (b->pad_choice_saved)
@@ -1552,7 +1717,7 @@ index 496d741..349f4b0 100644
      if (b->audio_enhanced_saved) {
          f << "\n[Audio]\n";
          f << "enhanced = " << (b->audio_enhanced ? 1 : 0) << "\n";
-@@ -1314,6 +1395,17 @@ runtime::ColorSettings resolve_color_settings(const char* toml_screen) {
+@@ -1316,6 +1397,17 @@ runtime::ColorSettings resolve_color_settings(const char* toml_screen) {
      return s;
  }
  
@@ -1570,7 +1735,7 @@ index 496d741..349f4b0 100644
  // SDL audio pull callback: render exactly `len` bytes of device-rate mono S16
  // from the bridge ring. The bridge emits faded silence (not raw zeros) before
  // prime / on underrun, so a momentarily-starved producer no longer clicks.
-@@ -1448,11 +1540,28 @@ PresentationLayout current_presentation_layout(Backend* b, int* out_w, int* out_
+@@ -1450,11 +1542,28 @@ PresentationLayout current_presentation_layout(Backend* b, int* out_w, int* out_
          SDL_GetWindowSize(b->window, &drawable_w, &drawable_h);
      }
      PresentationLayout layout{};
@@ -1600,7 +1765,7 @@ index 496d741..349f4b0 100644
      } else {
          // Pad-only titles: reserve roughly one fifth of the display on each
          // side for the controls. Prefer an exact integer multiple so pixel art
-@@ -1572,8 +1681,22 @@ void open_runtime_menu_from_touch(Backend* b) {
+@@ -1574,8 +1683,22 @@ void open_runtime_menu_from_touch(Backend* b) {
  
  #if defined(GBARECOMP_RUNTIME_UI)
  
@@ -1624,7 +1789,7 @@ index 496d741..349f4b0 100644
      if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_ESCAPE &&
          !recomp_runtime_ui_is_open(ui)) {
          recomp_runtime_ui_open(ui);
-@@ -1705,11 +1828,13 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
+@@ -1707,11 +1830,13 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
      b->title = title ? title : "gbarecomp";
  #if defined(__ANDROID__)
      b->touch_controls = true;
@@ -1639,7 +1804,7 @@ index 496d741..349f4b0 100644
      // Desktop validation of inset-aware layouts: GBARECOMP_SAFE_INSETS=l,t,r,b
      // (drawable pixels). Android supplies real cutout insets separately.
      if (const char* insets = std::getenv("GBARECOMP_SAFE_INSETS")) {
-@@ -1750,7 +1875,6 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
+@@ -1754,7 +1879,6 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
                                     : "LandscapeLeft LandscapeRight";
      SDL_SetHint(SDL_HINT_ORIENTATIONS, orientation_hint);
      if (orientation_policy_ == 2) window_flags |= SDL_WINDOW_RESIZABLE;
@@ -1647,7 +1812,7 @@ index 496d741..349f4b0 100644
  #endif
      b->window = SDL_CreateWindow(title ? title : "gbarecomp",
                                   SDL_WINDOWPOS_CENTERED,
-@@ -1764,7 +1888,10 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
+@@ -1768,7 +1892,10 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
          return false;
      }
  #if defined(__ANDROID__)
@@ -1659,7 +1824,7 @@ index 496d741..349f4b0 100644
  #endif
      {
          // Physical density for touch targets and gesture thresholds.
-@@ -1909,7 +2036,8 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
+@@ -1936,7 +2063,8 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
      want.freq     = 65536;
      want.format   = AUDIO_S16SYS;
      want.channels = 1;
@@ -1669,7 +1834,7 @@ index 496d741..349f4b0 100644
      const char* direct_audio_env = std::getenv("GBARECOMP_AUDIO_DIRECT");
      b->audio_direct =
          direct_audio_env && *direct_audio_env && *direct_audio_env != '0';
-@@ -1957,10 +2085,20 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
+@@ -1984,10 +2112,20 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
              cfg.channels    = 1;
              cfg.source_rate = 65536.0;                 // engine's standardized GBA mixer rate
              cfg.host_rate   = static_cast<double>(got.freq);
@@ -1693,7 +1858,7 @@ index 496d741..349f4b0 100644
              SDL_PauseAudioDevice(b->audio_dev, 0);      // start the callback
          }
      }
-@@ -2282,6 +2420,7 @@ void HostWindow::close() {
+@@ -2312,6 +2450,7 @@ void HostWindow::close() {
      runtime_imgui_shutdown(b);
  #endif
      destroy_sharp_texture(b);
@@ -1701,7 +1866,7 @@ index 496d741..349f4b0 100644
      if (b->texture)   SDL_DestroyTexture(b->texture);
      if (b->renderer)  SDL_DestroyRenderer(b->renderer);
      if (b->window)    SDL_DestroyWindow(b->window);
-@@ -2320,6 +2459,7 @@ bool HostWindow::set_surface_size(int base_w, int base_h) {
+@@ -2351,6 +2490,7 @@ bool HostWindow::set_surface_size(int base_w, int base_h) {
  #endif
      SDL_DestroyTexture(b->texture);
      destroy_sharp_texture(b);
@@ -1709,7 +1874,7 @@ index 496d741..349f4b0 100644
      b->texture = replacement;
      b->presentation_source_w = b->presentation_source_h = 0;
      b->base_w = base_w;
-@@ -2372,6 +2512,49 @@ bool HostWindow::drawable_size(int* width, int* height) const {
+@@ -2403,6 +2543,49 @@ bool HostWindow::drawable_size(int* width, int* height) const {
  
  void HostWindow::present(const uint8_t* rgb888) { present(rgb888, 0, 0); }
  
@@ -1759,13 +1924,13 @@ index 496d741..349f4b0 100644
  void HostWindow::present(const uint8_t* rgb888, unsigned sampled_w, unsigned sampled_h) {
      if (!open_ || !impl_ || !rgb888) return;
      auto* b = static_cast<Backend*>(impl_);
-@@ -2389,26 +2572,38 @@ void HostWindow::present(const uint8_t* rgb888, unsigned sampled_w, unsigned sam
+@@ -2420,27 +2603,39 @@ void HostWindow::present(const uint8_t* rgb888, unsigned sampled_w, unsigned sam
          };
          while ((info.max_texture_width > 0 && upload_w > unsigned(info.max_texture_width)) ||
                 (info.max_texture_height > 0 && upload_h > unsigned(info.max_texture_height))) shrink();
 -        SDL_Texture* replacement = nullptr;
 -        while (upload_w != unsigned(texture_w) || upload_h != unsigned(texture_h)) {
--            replacement = SDL_CreateTexture(b->renderer, SDL_PIXELFORMAT_RGB24,
+-            replacement = SDL_CreateTexture(b->renderer, b->texture_format,
 -                SDL_TEXTUREACCESS_STREAMING, int(upload_w), int(upload_h));
 -            if (replacement) break;
 -            if (upload_w == 1 && upload_h == 1)
@@ -1773,6 +1938,7 @@ index 496d741..349f4b0 100644
 -            shrink();
 -        }
 -        if (replacement) {
+-            SDL_SetTextureBlendMode(replacement, SDL_BLENDMODE_NONE);
 +        // Keep the previous texture as a second slot: smooth motion alternates
 +        // native frames with interpolated 2x ones, which would otherwise
 +        // recreate the texture on every present.
@@ -1784,7 +1950,7 @@ index 496d741..349f4b0 100644
 +        } else {
 +            SDL_Texture* replacement = nullptr;
 +            while (upload_w != unsigned(texture_w) || upload_h != unsigned(texture_h)) {
-+                replacement = SDL_CreateTexture(b->renderer, SDL_PIXELFORMAT_RGB24,
++                replacement = SDL_CreateTexture(b->renderer, b->texture_format,
 +                    SDL_TEXTUREACCESS_STREAMING, int(upload_w), int(upload_h));
 +                if (replacement) break;
 +                if (upload_w == 1 && upload_h == 1)
@@ -1792,6 +1958,7 @@ index 496d741..349f4b0 100644
 +                shrink();
 +            }
 +            if (replacement) {
++                SDL_SetTextureBlendMode(replacement, SDL_BLENDMODE_NONE);
  #if SDL_VERSION_ATLEAST(2, 0, 12)
 -            SDL_SetTextureScaleMode(replacement, b->linear_filter ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
 +                SDL_SetTextureScaleMode(replacement, b->linear_filter ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
@@ -1813,7 +1980,7 @@ index 496d741..349f4b0 100644
      }
      // Large elective scales can exceed an older GPU's texture limit. Keep the
      // complete CPU raster and reduce only the upload, preserving logical view
-@@ -2507,43 +2702,12 @@ void HostWindow::present(const uint8_t* rgb888, unsigned sampled_w, unsigned sam
+@@ -2548,43 +2743,12 @@ void HostWindow::present(const uint8_t* rgb888, unsigned sampled_w, unsigned sam
      }
      if (touch_input_enabled(b)) publish_touch_presentation(b);
  #if defined(__ANDROID__)
@@ -1859,7 +2026,7 @@ index 496d741..349f4b0 100644
      }
  #endif
      render_host_layers(b);
-@@ -2585,6 +2749,17 @@ void HostWindow::load_input_config(const char* dir,
+@@ -2626,6 +2790,17 @@ void HostWindow::load_input_config(const char* dir,
          fast_forward_multiplier_default, 2, 10);
      const std::string base = std::string(dir) + "/";
  
@@ -1877,7 +2044,7 @@ index 496d741..349f4b0 100644
      // keybinds.ini [player1] (recomp-ui generic format, scancode names).
      ini_scan_section((base + "keybinds.ini").c_str(), "player1",
                       [b](const char* key, const char* val) {
-@@ -2643,9 +2818,8 @@ void HostWindow::set_fullscreen(int mode) {
+@@ -2684,9 +2859,8 @@ void HostWindow::set_fullscreen(int mode) {
      if (!open_ || !impl_) return;
      auto* b = static_cast<Backend*>(impl_);
  #if defined(__ANDROID__)
@@ -1889,7 +2056,7 @@ index 496d741..349f4b0 100644
      return;
  #endif
      if (mode < 0) mode = 0;
-@@ -2716,6 +2890,9 @@ void HostWindow::set_linear_filter(bool enabled) {
+@@ -2757,6 +2931,9 @@ void HostWindow::set_linear_filter(bool enabled) {
  #if SDL_VERSION_ATLEAST(2, 0, 12)
      SDL_SetTextureScaleMode(b->texture,
          enabled ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
@@ -1899,7 +2066,7 @@ index 496d741..349f4b0 100644
  #endif
  }
  
-@@ -2735,6 +2912,19 @@ bool HostWindow::audio_enabled() const {
+@@ -2776,6 +2953,19 @@ bool HostWindow::audio_enabled() const {
      return b->audio_dev && SDL_GetAudioDeviceStatus(b->audio_dev) == SDL_AUDIO_PLAYING;
  }
  
@@ -1919,7 +2086,7 @@ index 496d741..349f4b0 100644
  void HostWindow::set_resize_driven_view(bool enabled) {
      if (!open_ || !impl_) return;
      auto* b = static_cast<Backend*>(impl_);
-@@ -2755,6 +2945,41 @@ void HostWindow::set_runtime_ui(RecompRuntimeUi* ui) {
+@@ -2796,6 +2986,41 @@ void HostWindow::set_runtime_ui(RecompRuntimeUi* ui) {
      if (!open_ || !impl_) return;
      static_cast<Backend*>(impl_)->runtime_ui = ui;
  }
@@ -1961,7 +2128,7 @@ index 496d741..349f4b0 100644
  #endif
  
  void HostWindow::configure_touch(bool policy, std::uint32_t claims,
-@@ -2777,13 +3002,16 @@ void HostWindow::configure_touch(bool policy, std::uint32_t claims,
+@@ -2818,13 +3043,16 @@ void HostWindow::configure_touch(bool policy, std::uint32_t claims,
      if (!b->pad_choice_saved) {
          const bool platform_default =
  #if defined(__ANDROID__)
@@ -1980,7 +2147,7 @@ index 496d741..349f4b0 100644
      TouchHub& hub = TouchHub::instance();
      hub.set_claims(policy ? claims : 0);
      // A game that owns long-press gets a snappier threshold; the engine's own
-@@ -2809,7 +3037,8 @@ void HostWindow::set_touch_config_dir(const char* dir) {
+@@ -2850,7 +3078,8 @@ void HostWindow::set_touch_config_dir(const char* dir) {
      ini_scan_section((b->touch_config_dir + "/config.ini").c_str(), "Touch",
                       [b](const char* key, const char* val) {
          if (SDL_strcasecmp(key, "pad_visible") == 0) {
@@ -1990,7 +2157,7 @@ index 496d741..349f4b0 100644
              b->pad_choice_saved = true;
          } else if (SDL_strcasecmp(key, "toggle_x") == 0) {
              b->toggle_fx = std::clamp(static_cast<float>(std::atof(val)), 0.0f, 1.0f);
-@@ -2819,6 +3048,13 @@ void HostWindow::set_touch_config_dir(const char* dir) {
+@@ -2860,6 +3089,13 @@ void HostWindow::set_touch_config_dir(const char* dir) {
              b->toggle_pos_saved = true;
          }
      });
@@ -2004,7 +2171,7 @@ index 496d741..349f4b0 100644
      ini_scan_section((b->touch_config_dir + "/config.ini").c_str(), "Audio",
                       [b](const char* key, const char* val) {
          if (SDL_strcasecmp(key, "enhanced") == 0) {
-@@ -2828,6 +3064,22 @@ void HostWindow::set_touch_config_dir(const char* dir) {
+@@ -2869,6 +3105,22 @@ void HostWindow::set_touch_config_dir(const char* dir) {
      });
  }
  
@@ -2027,7 +2194,7 @@ index 496d741..349f4b0 100644
  bool HostWindow::saved_audio_enhanced(bool& enabled) const {
      if (!open_ || !impl_) return false;
      auto* b = static_cast<const Backend*>(impl_);
-@@ -2853,9 +3105,12 @@ void HostWindow::set_touch_pad_visible(bool visible) {
+@@ -2894,9 +3146,12 @@ void HostWindow::set_touch_pad_visible(bool visible) {
      if (!open_ || !impl_) return;
      auto* b = static_cast<Backend*>(impl_);
      visible = visible && b->touch_controls;
@@ -2042,7 +2209,7 @@ index 496d741..349f4b0 100644
      // Any finger currently on a pad button is released with the pad.
      for (auto& t : b->touches)
          if (t.active && t.pad) t.buttons = 0;
-@@ -3011,7 +3266,7 @@ HostWindow::Events HostWindow::pump() {
+@@ -3052,7 +3307,7 @@ HostWindow::Events HostWindow::pump() {
              ImGui::SetCurrentContext(b->runtime_imgui_context);
              ImGui_ImplSDL2_ProcessEvent(&e);
          }
@@ -2051,7 +2218,7 @@ index 496d741..349f4b0 100644
  #endif
          if (e.type == SDL_QUIT) {
              ev.quit = true;
-@@ -3025,12 +3280,17 @@ HostWindow::Events HostWindow::pump() {
+@@ -3066,12 +3321,17 @@ HostWindow::Events HostWindow::pump() {
              ev.terminating = true;
              ev.quit = true;
          } else if (e.type == SDL_CONTROLLERDEVICEADDED) {
@@ -2070,7 +2237,7 @@ index 496d741..349f4b0 100644
              }
          } else if (e.type == SDL_WINDOWEVENT &&
                     e.window.event == SDL_WINDOWEVENT_CLOSE) {
-@@ -3225,25 +3485,70 @@ HostWindow::Events HostWindow::pump() {
+@@ -3266,25 +3526,70 @@ HostWindow::Events HostWindow::pump() {
      // inputs. Keyboard and controller are additive so either can be used at
      // any time, including while testing motion.
      if (b->controller && SDL_GameControllerGetAttached(b->controller)) {
@@ -2159,7 +2326,7 @@ index 496d741..349f4b0 100644
      }
      if (b->touch_controls) {
          const uint16_t touch_buttons = active_touch_buttons(b);
-@@ -3369,6 +3674,10 @@ bool HostWindow::drawable_size(int* /*width*/, int* /*height*/) const {
+@@ -3410,6 +3715,10 @@ bool HostWindow::drawable_size(int* /*width*/, int* /*height*/) const {
  
  void HostWindow::present(const uint8_t* /*rgb888*/) {}
  void HostWindow::present(const uint8_t*, unsigned, unsigned) {}
@@ -2170,7 +2337,7 @@ index 496d741..349f4b0 100644
  
  void HostWindow::load_input_config(const char* /*dir*/,
                                     bool /*assist_tools_default*/,
-@@ -3381,13 +3690,19 @@ int  HostWindow::volume() const { return 100; }
+@@ -3422,13 +3731,19 @@ int  HostWindow::volume() const { return 100; }
  int  HostWindow::window_scale() const { return 1; }
  void HostWindow::set_linear_filter(bool /*enabled*/) {}
  bool HostWindow::linear_filter() const { return false; }
@@ -2401,10 +2568,10 @@ index 266c987..010c5ae 100644
      }
  };
 diff --git a/src/runtime/runtime.cpp b/src/runtime/runtime.cpp
-index 1eb5011..5f00fac 100644
+index 6466862..445ef20 100644
 --- a/src/runtime/runtime.cpp
 +++ b/src/runtime/runtime.cpp
-@@ -197,6 +197,9 @@ struct Args {
+@@ -198,6 +198,9 @@ struct Args {
      bool sharp_filter = false;    // --sharp-filter 1: integer prescale + linear finish
      int internal_resolution = 1;
      bool internal_resolution_set = false;
@@ -2414,7 +2581,7 @@ index 1eb5011..5f00fac 100644
      bool affine_filter = false;   // --affine-filter 1: game-authorized smoothing
      float gyro_sensitivity = 0.25f; // --gyro-sensitivity 0.25..4.00
      // [audio] shadow = true|false — arm the MP2K verified-enhancement shadow
-@@ -293,6 +296,7 @@ int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
+@@ -294,6 +297,7 @@ int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
      else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_RESOLUTION_SCALE) == 0 && c->internal_resolution)
          *out = *c->internal_resolution;
      else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER) == 0) *out = c->window->linear_filter();
@@ -2422,7 +2589,7 @@ index 1eb5011..5f00fac 100644
      else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_AUDIO) == 0) *out = c->window->audio_enabled();
      else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_VOLUME) == 0) *out = c->window->volume();
      else if (std::strcmp(item->key, GBARECOMP_UI_KEY_STATE_SLOT) == 0) *out = c->state_slot;
-@@ -306,6 +310,10 @@ int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
+@@ -307,6 +311,10 @@ int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
      else if (std::strcmp(item->key,
                           GBARECOMP_UI_KEY_FAST_FORWARD_SPEED) == 0)
          *out = c->fast_forward_multiplier;
@@ -2433,7 +2600,7 @@ index 1eb5011..5f00fac 100644
  #if defined(RECOMP_RUNTIME_UI_KEY_GYRO_SENSITIVITY)
      else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_GYRO_SENSITIVITY) == 0 &&
               c->gyro_sensitivity)
-@@ -329,6 +337,8 @@ int runtime_ui_set(void* opaque, const RecompRuntimeUiItem* item, int value) {
+@@ -330,6 +338,8 @@ int runtime_ui_set(void* opaque, const RecompRuntimeUiItem* item, int value) {
          *c->internal_resolution = std::clamp(value, 1, int(gba::GbaHighResolutionFrame::kMaxScale));
      else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER) == 0)
          c->window->set_linear_filter(value != 0);
@@ -2442,7 +2609,7 @@ index 1eb5011..5f00fac 100644
      else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_AUDIO) == 0)
          c->window->set_audio_enabled(value != 0);
      else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_VOLUME) == 0)
-@@ -349,6 +359,10 @@ int runtime_ui_set(void* opaque, const RecompRuntimeUiItem* item, int value) {
+@@ -350,6 +360,10 @@ int runtime_ui_set(void* opaque, const RecompRuntimeUiItem* item, int value) {
      else if (std::strcmp(item->key,
                           GBARECOMP_UI_KEY_FAST_FORWARD_SPEED) == 0)
          c->fast_forward_multiplier = std::clamp(value, 2, 10);
@@ -2453,7 +2620,7 @@ index 1eb5011..5f00fac 100644
  #if defined(RECOMP_RUNTIME_UI_KEY_GYRO_SENSITIVITY)
      else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_GYRO_SENSITIVITY) == 0 &&
               c->gyro_sensitivity)
-@@ -810,6 +824,8 @@ bool apply_toml_file(const std::filesystem::path& path, Args* args,
+@@ -811,6 +825,8 @@ bool apply_toml_file(const std::filesystem::path& path, Args* args,
                  return false;
              }
              args->internal_resolution = scale;
@@ -2462,7 +2629,7 @@ index 1eb5011..5f00fac 100644
          } else if (section == "video" && key == "affine_filter") {
              args->affine_filter = (val == "true" || val == "1");
          } else if (section == "video" && key == "widescreen") {
-@@ -1560,7 +1576,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -1561,7 +1577,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
          return 1;
      }
      std::string rom_sha1 = lower_ascii(gba::sha1(rom.data(), rom.size()).hex());
@@ -2476,7 +2643,7 @@ index 1eb5011..5f00fac 100644
          std::fprintf(stderr,
                       "[gbarecomp:runtime] ROM SHA-1 mismatch: got %s expected %s\n",
                       rom_sha1.c_str(), args.rom_sha1.c_str());
-@@ -1712,6 +1733,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -1719,6 +1740,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
      g_force_interp = 0;
      if (const char* fi = std::getenv("GBARECOMP_FORCE_INTERP"))
          g_force_interp = (fi[0] && fi[0] != '0') ? 1 : 0;
@@ -2487,16 +2654,16 @@ index 1eb5011..5f00fac 100644
      std::fprintf(stderr, "cpu_backend=%s\n",
                   g_force_interp ? "interpreter (GBARECOMP_FORCE_INTERP)"
                                  : "static-recompiled");
-@@ -1918,7 +1943,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -1925,7 +1950,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
          bus.audio().shadow_hook_pcs(g_runtime_observed_pcs,
                                      RUNTIME_MAX_OBSERVED_PCS));
      g_runtime_dispatch_observer = g_runtime_observed_pc_count
--        ? [](uint32_t pc, int thumb) {
+-        ? +[](uint32_t pc, int thumb) {
 +        ? +[](uint32_t pc, int thumb) {  // + : GCC 11 won't pick a common type with nullptr
                if (gba::GbaBus* b = gbarecomp::active_bus())
                    b->audio().shadow_driver_tick(pc, thumb != 0);
            }
-@@ -2293,6 +2318,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -2300,6 +2325,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
              uint32_t n = runtime_swi_log_save_file(sl);
              std::printf("swi_log_saved path=\"%s\" records=%u\n", sl, n);
          }
@@ -2509,7 +2676,7 @@ index 1eb5011..5f00fac 100644
          if (const char* iw = std::getenv("GBARECOMP_IWRAM_DUMP")) {
              std::ofstream dump(iw, std::ios::binary | std::ios::trunc);
              dump.write(reinterpret_cast<const char*>(bus.iwram_ptr()),
-@@ -2379,7 +2410,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -2386,7 +2417,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
      };
      auto do_savestate_save = [&](const std::string& path,
                                   std::string& e) -> bool {
@@ -2520,7 +2687,7 @@ index 1eb5011..5f00fac 100644
      };
      auto do_savestate_load = [&](const std::string& path,
                                   std::string& e) -> bool {
-@@ -2407,6 +2440,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -2414,6 +2447,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
  #if defined(GBARECOMP_WEB_HOST)
          bus.audio().discard_playback();
  #endif
@@ -2528,7 +2695,7 @@ index 1eb5011..5f00fac 100644
          return true;
      };
      auto do_savestate_save_bytes = [&](std::vector<uint8_t>& bytes,
-@@ -2427,6 +2461,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -2434,6 +2468,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
  #if defined(GBARECOMP_WEB_HOST)
          bus.audio().discard_playback();
  #endif
@@ -2536,7 +2703,7 @@ index 1eb5011..5f00fac 100644
          return true;
      };
  
-@@ -2664,12 +2699,17 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -2671,12 +2706,17 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
      if (opts.input_frame) {
          TouchHub::instance().set_claims(opts.touch_gesture_claims);
          publish_headless_touch_presentation();
@@ -2555,7 +2722,7 @@ index 1eb5011..5f00fac 100644
      struct ClearVblankInputHook {
          ~ClearVblankInputHook() { runtime_set_vblank_input_hook(nullptr); }
      } clear_vblank_input_hook;
-@@ -2909,6 +2949,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -2916,6 +2956,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
          framedump_start = std::strtoull(e, nullptr, 0);
      if (const char* e = std::getenv("GBARECOMP_FRAMEDUMP_COUNT"))
          framedump_max = std::atoi(e);
@@ -2566,7 +2733,7 @@ index 1eb5011..5f00fac 100644
      // ── HP-002 frame-phase ring ─────────────────────────────────────────
      // Opt-in per-presented-frame breakdown of where wall time went
      // between consecutive presents: guest execution, view-sync + render/
-@@ -2992,13 +3036,74 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -2999,13 +3043,74 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
      };
      FramePhaseRing frame_phase;
      uint64_t high_resolution_presented = 0;
@@ -2642,7 +2809,7 @@ index 1eb5011..5f00fac 100644
      };
      auto apply_runtime_view_geometry = [&](ViewGeometry geometry) -> bool {
          if (opts.view_geometry) opts.view_geometry(&geometry, 0, 0);
-@@ -3089,10 +3194,6 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -3096,10 +3201,6 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
          }
          return true;
      };
@@ -2653,7 +2820,7 @@ index 1eb5011..5f00fac 100644
      // Windowed observe-mode TCP (see Args::tcp_observe_port). Savestate
      // requests from its thread are executed by the main loop at the next
      // present, the only point where machine state is consistent.
-@@ -3182,6 +3283,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -3189,6 +3290,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
              win.configure_touch(opts.input_frame != nullptr,
                                  opts.touch_gesture_claims,
                                  opts.touch_pad_default, args.touch_emulation);
@@ -2661,7 +2828,7 @@ index 1eb5011..5f00fac 100644
              win.set_touch_config_dir(exe_dir.c_str());
              // The player's menu choice wins over [audio].shadow;
              // GBARECOMP_AUDIO_SHADOW still overrides both.
-@@ -3232,6 +3334,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -3239,6 +3341,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
          }
          if (args.fullscreen) win.set_fullscreen(args.fullscreen);
          win.set_volume(args.volume);
@@ -2669,7 +2836,7 @@ index 1eb5011..5f00fac 100644
          win.set_fps_readout(opts.show_fps_by_default);
  #if defined(GBARECOMP_RUNTIME_UI)
          runtime_ui_context.window = &win;
-@@ -3263,7 +3366,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -3270,7 +3373,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
          RecompRuntimeUiStandardConfig runtime_ui_config{};
          runtime_ui_config.menu.title = runtime_title;
          runtime_ui_config.menu.subtitle = "Game Boy Advance runtime settings";
@@ -2678,7 +2845,7 @@ index 1eb5011..5f00fac 100644
  #if defined(RECOMP_RUNTIME_UI_HAS_PRESENTATION_FLAGS)
          if (opts.ui_touch_friendly) {
              runtime_ui_config.menu.presentation_flags |=
-@@ -3308,15 +3411,16 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -3315,15 +3418,16 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                  RECOMP_RUNTIME_UI_STANDARD_SAVE_STATE |
                  RECOMP_RUNTIME_UI_STANDARD_LOAD_STATE;
          }
@@ -2698,7 +2865,7 @@ index 1eb5011..5f00fac 100644
          // A mobile game has no window to close and the system Back button is
          // routed to the game, so the menu is the only clean way out: it ends
          // the session (save flushed, no suspend state) and the Activity
-@@ -3446,6 +3550,32 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -3453,6 +3557,32 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
          fps_item.type        = RECOMP_RUNTIME_UI_BOOL;
          runtime_ui_extras.push_back(fps_item);
  
@@ -2731,7 +2898,7 @@ index 1eb5011..5f00fac 100644
          if (opts.ui_extra_items && opts.ui_extra_item_count) {
              const auto* game_items =
                  static_cast<const RecompRuntimeUiItem*>(opts.ui_extra_items);
-@@ -3458,6 +3588,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -3465,6 +3595,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
          runtime_ui_context.ui =
              recomp_runtime_ui_create_standard(&runtime_ui_config);
          win.set_runtime_ui(runtime_ui_context.ui);
@@ -2739,7 +2906,7 @@ index 1eb5011..5f00fac 100644
  #endif
          sync_resize_driven_view();
          if (live_fb.empty()) live_fb.assign(ppu.render_bytes(), 0);
-@@ -3533,7 +3664,6 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -3540,7 +3671,6 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
          return !opts.expose_assist_tools || win.assist_tools_enabled();
  #endif
      };
@@ -2747,7 +2914,7 @@ index 1eb5011..5f00fac 100644
      int fast_forward_multiplier = std::clamp(
          win.fast_forward_multiplier(), 2, 10);
      auto capture_rewind_point = [&]() {
-@@ -4904,6 +5034,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+@@ -4911,6 +5041,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                  if (present_frame) present_live_frame();
                  // Framedump (capture runs only) is attributed to present_us.
                  if (framedump_dir && frame >= framedump_start &&
@@ -2817,10 +2984,10 @@ index 7e086e4..7d534a0 100644
      // it is still being profiled. Explicit CLI/TOML opt-ins remain available.
      // Defaults true so existing games (including MMZ) retain today's UI.
 diff --git a/tests/bus/test_main.cpp b/tests/bus/test_main.cpp
-index 3b5843e..35cb13a 100644
+index 8ec7bbf..6f072cf 100644
 --- a/tests/bus/test_main.cpp
 +++ b/tests/bus/test_main.cpp
-@@ -7,6 +7,7 @@
+@@ -8,6 +8,7 @@
  #include <cstring>
  #include <filesystem>
  #include <fstream>
@@ -2828,15 +2995,26 @@ index 3b5843e..35cb13a 100644
  #include <string>
  #include <vector>
  
-@@ -353,6 +354,88 @@ void test_v2_trailing_container_rejects_before_guest_mutation() {
+@@ -355,6 +356,8 @@ void test_older_snapshots_rejected_before_restore() {
+                catalog.register_provider(provider, &error), true);
+     debug::SnapshotContext provider_context = context;
+     provider_context.mod_state = &catalog;
++    // Versions 2 and 4 now load in their own layouts, so name an unsupported one.
++    patch_snapshot_version(v1_path, 1);
+     bus.write8(0x02000000u, 0xbb);
+     error.clear();
+     check_bool("snapshot_legacy_v1", "provider catalog rejected",
+@@ -456,6 +459,157 @@ void test_trailing_container_rejects_before_guest_mutation() {
      std::filesystem::remove(path, ec);
  }
  
-+// Rewrites a current snapshot in the version-2 layout: the CPU section ends
-+// before the SWI continuation count (which must be 0). `extra` appends that
-+// many stray bytes to the section to check the framing still holds.
-+bool write_swi_less_v2(const std::filesystem::path& from, const std::filesystem::path& to,
-+                       uint32_t extra) {
++// Rewrites a current (v5) snapshot in an older layout: no TIME section, the
++// AUDIO payload replaced by `audio` (the pre-v5 layout of the same mixer),
++// and for version 2 the CPU section ending before the SWI continuation count
++// (which must be 0). `extra` appends that many stray bytes to the CPU section
++// to check the framing still holds.
++bool write_pre_timing(const std::filesystem::path& from, const std::filesystem::path& to,
++                      uint32_t version, const std::vector<uint8_t>& audio, uint32_t extra) {
 +    std::ifstream in(from, std::ios::binary);
 +    std::vector<char> d((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 +    auto u32_at = [&d](std::size_t o) {
@@ -2845,29 +3023,51 @@ index 3b5843e..35cb13a 100644
 +               static_cast<uint32_t>(static_cast<uint8_t>(d[o + 2])) << 16 |
 +               static_cast<uint32_t>(static_cast<uint8_t>(d[o + 3])) << 24;
 +    };
-+    auto put_u32 = [&d](std::size_t o, uint32_t v) {
-+        for (int i = 0; i < 4; ++i) d[o + i] = static_cast<char>((v >> (8 * i)) & 0xffu);
++    auto put_u32 = [](std::vector<char>& v, uint32_t x) {
++        for (int i = 0; i < 4; ++i) v.push_back(static_cast<char>((x >> (8 * i)) & 0xffu));
 +    };
 +    if (d.size() < 52) return false;
 +    const uint32_t sections = u32_at(48);
++    std::vector<char> out(d.begin(), d.begin() + 52);
++    uint32_t kept = 0;
++    bool cpu_done = version != 2;
 +    std::size_t pos = 52;
 +    for (uint32_t i = 0; i < sections && pos + 8 <= d.size(); ++i) {
 +        const uint32_t size = u32_at(pos + 4);
-+        if (std::memcmp(&d[pos], "CPU0", 4) == 0) {
-+            const std::size_t count_at = pos + 8 + size - 4;
-+            if (size < 4 || u32_at(count_at) != 0) return false;
-+            d.erase(d.begin() + static_cast<std::ptrdiff_t>(count_at),
-+                    d.begin() + static_cast<std::ptrdiff_t>(count_at + 4));
-+            d.insert(d.begin() + static_cast<std::ptrdiff_t>(count_at), extra, '\0');
-+            put_u32(pos + 4, size - 4 + extra);
-+            put_u32(4, 2);
-+            std::ofstream out(to, std::ios::binary | std::ios::trunc);
-+            out.write(d.data(), static_cast<std::streamsize>(d.size()));
-+            return static_cast<bool>(out);
-+        }
++        const char* tag = &d[pos];
++        std::vector<char> body(d.begin() + static_cast<std::ptrdiff_t>(pos + 8),
++                               d.begin() + static_cast<std::ptrdiff_t>(pos + 8 + size));
 +        pos += 8 + size;
++        if (std::memcmp(tag, "TIME", 4) == 0) continue;
++        if (std::memcmp(tag, "AUD0", 4) == 0 || std::memcmp(tag, "AUDI", 4) == 0 ||
++            std::memcmp(tag, "APU0", 4) == 0) {
++            body.assign(audio.begin(), audio.end());
++        }
++        if (version == 2 && std::memcmp(tag, "CPU0", 4) == 0) {
++            if (body.size() < 4) return false;
++            const std::size_t count_at = body.size() - 4;
++            if (body[count_at] || body[count_at + 1] || body[count_at + 2] || body[count_at + 3]) return false;
++            body.resize(count_at);
++            body.insert(body.end(), extra, '\0');
++            cpu_done = true;
++        }
++        out.insert(out.end(), tag, tag + 4);
++        put_u32(out, static_cast<uint32_t>(body.size()));
++        out.insert(out.end(), body.begin(), body.end());
++        ++kept;
 +    }
-+    return false;
++    if (!cpu_done) return false;
++    for (int i = 0; i < 4; ++i) out[4 + i] = static_cast<char>((version >> (8 * i)) & 0xffu);
++    for (int i = 0; i < 4; ++i) out[48 + i] = static_cast<char>((kept >> (8 * i)) & 0xffu);
++    std::ofstream o(to, std::ios::binary | std::ios::trunc);
++    o.write(out.data(), static_cast<std::streamsize>(out.size()));
++    return static_cast<bool>(o);
++}
++
++std::vector<uint8_t> pre_timing_audio(const gba::GbaBus& bus) {
++    gbarecomp::debug::SnapshotWriter w;
++    bus.audio().serialize(w, false);
++    return w.buffer();
 +}
 +
 +void test_v2_swi_less_snapshot_loads() {
@@ -2890,9 +3090,10 @@ index 3b5843e..35cb13a 100644
 +    bus.write8(0x02000000u, 0x11);
 +    check_bool("snapshot_v2_swi_less", "write source",
 +               debug::save_state(source.string().c_str(), context, &error), true);
-+    check_bool("snapshot_v2_swi_less", "rewrite as v2", write_swi_less_v2(source, v2, 0), true);
++    const auto audio = pre_timing_audio(bus);
++    check_bool("snapshot_v2_swi_less", "rewrite as v2", write_pre_timing(source, v2, 2, audio, 0), true);
 +    check_bool("snapshot_v2_swi_less", "rewrite as v2 with stray CPU bytes",
-+               write_swi_less_v2(source, v2_stray, 4), true);
++               write_pre_timing(source, v2_stray, 2, audio, 4), true);
 +
 +    // Suspend states and slots written before the SWI continuations existed
 +    // load with none pending.
@@ -2914,14 +3115,59 @@ index 3b5843e..35cb13a 100644
 +    std::filesystem::remove(v2_stray, ec);
 +}
 +
++void test_v4_pre_timing_snapshot_loads() {
++    namespace debug = gbarecomp::debug;
++    const char* t = "snapshot_v4_pre_timing";
++    gba::GbaBus bus;
++    gba::GbaPpu ppu;
++    debug::ModStateRegistry empty_catalog;
++    debug::SnapshotContext context;
++    context.bus = &bus;
++    context.ppu = &ppu;
++    context.rom_sha1 = "0123456789012345678901234567890123456789";
++    context.mod_state = &empty_catalog;
++    std::string error;
++    std::error_code ec;
++    const auto dir = std::filesystem::temp_directory_path();
++    const auto source = dir / "gbarecomp-v4-source.gbas";
++    const auto v4 = dir / "gbarecomp-v4.gbas";
++    const auto v4_v5_audio = dir / "gbarecomp-v4-v5-audio.gbas";
++
++    bus.write8(0x02000000u, 0x11);
++    check_bool(t, "write source", debug::save_state(source.string().c_str(), context, &error), true);
++    check_bool(t, "rewrite as v4", write_pre_timing(source, v4, 4, pre_timing_audio(bus), 0), true);
++    gbarecomp::debug::SnapshotWriter current;
++    bus.audio().serialize(current, true);
++    check_bool(t, "rewrite as v4 with v5 audio",
++               write_pre_timing(source, v4_v5_audio, 4, current.buffer(), 0), true);
++
++    // Suspend states from the v4 runtimes load: no TIME section, PSG 3/4 reset.
++    bus.write8(0x02000000u, 0x22);
++    error.clear();
++    check_bool(t, "v4 loads", debug::load_state(v4.string().c_str(), context, &error), true);
++    check_eq(t, "guest restored", bus.read8(0x02000000u), 0x11u);
++
++    // A v4 file whose AUDIO has the v5 layout is refused before restoring.
++    bus.write8(0x02000000u, 0x33);
++    error.clear();
++    check_bool(t, "v5 audio in v4 rejected",
++               debug::load_state(v4_v5_audio.string().c_str(), context, &error), false);
++    check_eq(t, "rejection leaves guest", bus.read8(0x02000000u), 0x33u);
++
++    std::filesystem::remove(source, ec);
++    std::filesystem::remove(v4, ec);
++    std::filesystem::remove(v4_v5_audio, ec);
++}
++
  void test_sram_bus_width_and_region_mirroring() {
      gba::GbaBus bus;
      bus.save().configure_sram(32 * 1024);
-@@ -777,6 +860,7 @@ int main() {
-     test_snapshot_mods_preflight_before_guest_restore();
-     test_legacy_v1_snapshot_empty_catalog_only();
-     test_v2_trailing_container_rejects_before_guest_mutation();
+@@ -882,6 +1036,8 @@ int main() {
+     test_older_snapshots_rejected_before_restore();
+     test_snapshot_pending_timing();
+     test_trailing_container_rejects_before_guest_mutation();
 +    test_v2_swi_less_snapshot_loads();
++    test_v4_pre_timing_snapshot_loads();
      test_sram_bus_width_and_region_mirroring();
      test_bios_undocumented_io_write();
      test_bios_window_writes_are_ignored();

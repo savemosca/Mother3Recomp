@@ -1,9 +1,9 @@
 {
   "gbarecomp": {
     "url": "https://github.com/mstan/gbarecomp.git",
-    "revision": "e353848ca8e82e7860469a235784a000102e7781",
+    "revision": "b09d343a2598c4e214c056bf8aa81ec9f8face2a",
     "patch": "patches/gbarecomp-runtime.patch",
-    "sha256": "7d44e685706d0641dd4d686cb6615663d18be116239204330d77474ece2e63c5",
+    "sha256": "22e23c26ebb4bfd2c396bd1aea79e072910e3c5047e93963dd4d93da3fa8850f",
     "submodules": {
       "external/arm-recomp-core": {
         "url": "https://github.com/mstan/arm-recomp-core.git",
