@@ -49,6 +49,7 @@ struct Field {
     bool on[3] = {};  // the layer's BG is enabled
 };
 Field g;  // written by tick(), read by the provider (both on the game thread)
+bool g_state_loaded = false;  // state_loaded() asks tick() to validate now
 bool g_field_now = false, g_battle_now = false;  // what the frame being rendered shows (frame_start)
 int g_misses = 0;  // consecutive failed checks of the field still in use
 int g_margin_left = 0, g_margin_right = 0;  // margin widths of the widened view, set by tick()
@@ -336,6 +337,28 @@ int place_obj(int, std::uint16_t attr0, std::uint16_t attr1, std::uint16_t, int*
     return 1;
 }
 
+// Text and numbers drawn over a BG0 window (the HP/PP boxes that SELECT slides
+// up from the bottom) are sprites. BG0 stops at the native edge row unless it
+// covers all of it, so above and below the screen such a sprite stops there
+// too: where BG0 is opaque on the edge row under it and doesn't continue, it
+// keeps the hardware's reading. Otherwise the name and digits floated past
+// the box's cut-off edge while it slid.
+int bg0_color_at(const std::uint8_t* r, const std::uint8_t* vram, int hx, int y);
+bool covering_edge_row(const std::uint8_t* r, const std::uint8_t* vram, int y, std::uint16_t* fill);
+
+bool over_window_edge(int sx, int w, bool top) {
+    const std::uint8_t* r = io();
+    gba::GbaBus* bus = gbarecomp::active_bus();
+    if (!r || !bus || !(io16(r, 0) & 0x100)) return false;  // BG0 off
+    const std::uint8_t* vram = bus->vram_ptr();
+    std::uint16_t fill;
+    if (covering_edge_row(r, vram, top ? -1 : 160, &fill)) return false;  // BG0 continues past it
+    const int ey = top ? 0 : 159;
+    for (int hx = std::max(sx, 0); hx < std::min(sx + w, 240); ++hx)
+        if (bg0_color_at(r, vram, hx, ey)) return true;
+    return false;
+}
+
 // The rows above and below the native screen draw only sprites this accepts:
 // field sprites reaching there whose feet are in this room. Everything else
 // keeps the hardware's reading and stays within the native rows.
@@ -346,6 +369,7 @@ int place_obj_y(int, std::uint16_t attr0, std::uint16_t attr1, std::uint16_t, in
     if (sy >= 0 && sy + h <= 160) return 0;  // within the native rows
     if (sy + h <= -g_margin_top || sy >= 160 + g_margin_bottom) return 0;  // in neither margin
     if (!obj_shows_in_margin(sx, sy, w, h)) return 0;
+    if (over_window_edge(sx, w, sy < 0)) return 0;
     *out_sy = sy;
     return 1;
 }
@@ -684,6 +708,21 @@ void set_detached(Field& f) {
 }
 }  // namespace
 
+// After a state load (the suspend state on launch, a save slot) the PPU seeds
+// only the native centre from the snapshot, and the frames shown until the
+// next full render kept black margins: they popped in two frames late.
+// Validate the field now and render the whole frame, margins included.
+void state_loaded() {
+    g_state_loaded = true;
+    tick();
+    gba::GbaPpu* ppu = gbarecomp::active_ppu();
+    gba::GbaBus* bus = gbarecomp::active_bus();
+    const std::uint8_t* r = io();
+    if (!ppu || !bus || !r || ppu->render_width() <= 240 || !g.ok) return;
+    frame_start();
+    ppu->latch_framebuffer(io16(r, 0), r, bus->vram_ptr(), bus->oam_ptr(), bus->pal_ptr());
+}
+
 void tick() {
     // Only for a widened view; at 240px the PPU path stays untouched. run_game()
     // clears every widescreen hook at startup, so (re)install from here.
@@ -693,10 +732,12 @@ void tick() {
     // Hooks start disabled and a launch disables them again; at 240px they stay off.
     for (const char* id : kCullHooks)
         if (!gba_mod_function_hook_enabled(id)) gba_mod_set_function_hook_enabled(id, 1);
-    // Checked every third frame; for half a second after a map change every
-    // frame, so a map entered through a fade has its margins as it fades in.
+    // Checked every third frame; for half a second after a map change (or a
+    // state load) every frame, so a map entered through a fade has its
+    // margins as it fades in.
     static int s_map = -1, s_fast = 0, s_skip = 0;
-    if (const int map = ew16(kMapId); map != s_map) s_map = map, s_fast = 30;
+    if (const int map = ew16(kMapId); map != s_map || g_state_loaded) s_map = map, s_fast = 30;
+    g_state_loaded = false;
     if (s_fast > 0) {
         --s_fast;
     } else if (s_skip > 0) {

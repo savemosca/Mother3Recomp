@@ -49,6 +49,7 @@ namespace {
 // so clouds flickered at the old screen edges. RunOptions::vblank_frame has
 // one owner; whatever was installed before runs after.
 void (*g_next_vblank)() = nullptr;
+void (*g_next_state_loaded)(const char*) = nullptr;
 void mother3_vblank() {
     m3widescreen::tick();  // throttles itself; nothing to do at 240 px
     m3devwarp::tick();
@@ -293,6 +294,11 @@ int mother3_main(int argc, char** argv) {
 #endif
     g_next_vblank = opts.vblank_frame;
     opts.vblank_frame = &mother3_vblank;
+    g_next_state_loaded = opts.savestate_loaded;
+    opts.savestate_loaded = [](const char* path) {
+        m3widescreen::state_loaded();
+        if (g_next_state_loaded) g_next_state_loaded(path);
+    };
     std::vector<char*> av;
     av.reserve(args.size());
     for (auto& arg : args) av.push_back(arg.data());
