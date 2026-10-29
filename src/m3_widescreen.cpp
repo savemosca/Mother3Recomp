@@ -338,38 +338,121 @@ int place_obj(int, std::uint16_t attr0, std::uint16_t attr1, std::uint16_t, int*
 }
 
 // Text and numbers drawn over a BG0 window (the HP/PP boxes that SELECT slides
-// up from the bottom) are sprites. BG0 stops at the native edge row unless it
-// covers all of it, so above and below the screen such a sprite stops there
-// too: where BG0 is opaque on the edge row under it and doesn't continue, it
-// keeps the hardware's reading. Otherwise the name and digits floated past
-// the box's cut-off edge while it slid.
+// up from the bottom) are sprites, and the window carries more of them just
+// off screen (the meter's next digits). Above and below the screen such a
+// sprite keeps the hardware's reading, cut at the edge like on the GBA, when
+// BG0 is opaque under it: on the edge row (the window there continues below,
+// see extend_solid_edge) or in its own rows (a window not up to the edge
+// yet). Bars that cover the whole edge row are the exception.
+std::uint32_t bg0_entry_at(const std::uint8_t* r, int hx, int y);
 int bg0_color_at(const std::uint8_t* r, const std::uint8_t* vram, int hx, int y);
 bool covering_edge_row(const std::uint8_t* r, const std::uint8_t* vram, int y, std::uint16_t* fill);
 
-bool over_window_edge(int sx, int w, bool top) {
+// Windows against the top or bottom edge (the HP/PP boxes SELECT slides up, a
+// menu) go on past it on the GBA, off screen, but the game draws only their
+// visible rows. Above and below the screen they continue from their own
+// tiles: the rest of the tile row the edge cuts through (those tiles' lower
+// pixels are in VRAM, e.g. the bottom of the "PP" line), then the side
+// borders and the interior, which repeat vertically. Per frame and edge, the
+// two BG0 entries for each tilemap column (bits 0-4), or -1. A run of opaque
+// edge pixels counts only when its side border tiles repeat one tile inwards
+// (a plain stretch of a bordered window, not its top border or a corner);
+// the interior is the commonest inner tile over its visible rows.
+struct WindowColumns {
+    std::uint64_t frame = ~std::uint64_t{0};
+    std::int32_t cut[32];   // the tile row the edge cuts through
+    std::int32_t fill[32];  // the rows past it
+};
+const WindowColumns& window_columns(const std::uint8_t* r, const std::uint8_t* vram, bool top) {
+    static WindowColumns s_cols[2];
+    gba::GbaPpu* ppu = gbarecomp::active_ppu();
+    const std::uint64_t frame = ppu ? ppu->frame_count() : 0;
+    WindowColumns& c = s_cols[top ? 0 : 1];
+    if (c.frame == frame) return c;
+    c.frame = frame;
+    std::fill(std::begin(c.cut), std::end(c.cut), -1);
+    std::fill(std::begin(c.fill), std::end(c.fill), -1);
+    const int ey = top ? 0 : 159, step = top ? 8 : -8;
+    const int hofs = io16(r, 0x10) & 0x1FF;
+    auto entry = [&](int hx, int y) {
+        const std::uint32_t at = bg0_entry_at(r, hx, y);
+        return static_cast<std::int32_t>(vram[at] | (vram[at + 1] << 8));
+    };
+    for (int hx = 0; hx < 240;) {
+        if (!bg0_color_at(r, vram, hx, ey)) { ++hx; continue; }
+        const int a = hx;
+        while (hx < 240 && bg0_color_at(r, vram, hx, ey)) ++hx;
+        const int b = hx - 1;
+        if (b - a < 23) continue;  // narrower than a bordered window
+        if (entry(a, ey) != entry(a, ey + step) || entry(b, ey) != entry(b, ey + step)) continue;
+        const int ta = (a + hofs) >> 3, tb = (b + hofs) >> 3;
+        if (tb - ta < 2) continue;
+        // The interior: the commonest inner tile over the window's visible rows.
+        std::int32_t interior = -1;
+        int best = 0, rows = 0;
+        for (int y = ey; y >= 0 && y < 160 && rows < 8 && bg0_color_at(r, vram, a, y); y += step, ++rows) {
+            for (int t = ta + 1; t < tb; ++t) {
+                const std::int32_t e = entry(t * 8 - hofs, y);
+                int n = 0;
+                for (int y2 = ey, k = 0; k <= rows; y2 += step, ++k)
+                    for (int u = ta + 1; u < tb; ++u) n += entry(u * 8 - hofs, y2) == e;
+                if (n > best) best = n, interior = e;
+            }
+        }
+        if (interior < 0 || best < tb - ta - 1) continue;  // not even one row's worth
+        for (int t = ta; t <= tb; ++t) {
+            c.cut[t & 31] = entry(std::clamp(t * 8 - hofs, a, b), ey);
+            c.fill[t & 31] = t == ta ? entry(a, ey) : t == tb ? entry(b, ey) : interior;
+        }
+    }
+    return c;
+}
+
+// The BG0 entry continuing the window at margin pixel (hx, y), or -1.
+std::int32_t window_entry(const std::uint8_t* r, const std::uint8_t* vram, int hx, int y) {
+    const bool top = y < 0;
+    const int ey = top ? 0 : 159;
+    if (!bg0_color_at(r, vram, hx, ey)) return -1;
+    const WindowColumns& c = window_columns(r, vram, top);
+    const int vofs = io16(r, 0x12) & 0x1FF, col = ((hx + (io16(r, 0x10) & 0x1FF)) >> 3) & 31;
+    return ((y + vofs) >> 3) == ((ey + vofs) >> 3) ? c.cut[col] : c.fill[col];
+}
+
+// For a sprite above or below the screen: 0 when it isn't over a window,
+// 1 over a window that continues there (the window's own name and digits:
+// drawn whole), 2 over one that doesn't (cut at the edge, like on the GBA).
+int window_state(int sx, int w, bool top) {
     const std::uint8_t* r = io();
     gba::GbaBus* bus = gbarecomp::active_bus();
-    if (!r || !bus || !(io16(r, 0) & 0x100)) return false;  // BG0 off
+    if (!r || !bus || !(io16(r, 0) & 0x100)) return 0;  // BG0 off
     const std::uint8_t* vram = bus->vram_ptr();
     std::uint16_t fill;
-    if (covering_edge_row(r, vram, top ? -1 : 160, &fill)) return false;  // BG0 continues past it
-    const int ey = top ? 0 : 159;
-    for (int hx = std::max(sx, 0); hx < std::min(sx + w, 240); ++hx)
-        if (bg0_color_at(r, vram, hx, ey)) return true;
-    return false;
+    if (covering_edge_row(r, vram, top ? -1 : 160, &fill)) return 0;  // a bar: BG0 continues
+    bool over = false, continued = true;
+    for (int hx = std::max(sx, 0); hx < std::min(sx + w, 240); ++hx) {
+        if (!bg0_color_at(r, vram, hx, top ? 0 : 159)) continue;
+        over = true;
+        if (window_entry(r, vram, hx, top ? -1 : 160) < 0) continued = false;
+    }
+    return !over ? 0 : continued ? 1 : 2;
 }
 
 // The rows above and below the native screen draw only sprites this accepts:
 // field sprites reaching there whose feet are in this room. Everything else
 // keeps the hardware's reading and stays within the native rows.
-int place_obj_y(int, std::uint16_t attr0, std::uint16_t attr1, std::uint16_t, int* out_sy) {
+int place_obj_y(int, std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2, int* out_sy) {
     if (!g_field_now || (!g_margin_top && !g_margin_bottom)) return 0;
     int sx, sy, w, h;
     if (!obj_box(attr0, attr1, &sx, &sy, &w, &h)) return 0;
     if (sy >= 0 && sy + h <= 160) return 0;  // within the native rows
     if (sy + h <= -g_margin_top || sy >= 160 + g_margin_bottom) return 0;  // in neither margin
-    if (!obj_shows_in_margin(sx, sy, w, h)) return 0;
-    if (over_window_edge(sx, w, sy < 0)) return 0;
+    const int window = window_state(sx, w, sy < 0);
+    // Interface sprites (OBJ priority 0: names and digits over BG0 windows)
+    // show above and below the screen only over a window continuing there;
+    // the game parks the hidden box's name just off screen (Y 161-163).
+    const bool interface = ((attr2 >> 10) & 3) == 0;
+    if (window == 2 || (interface && window != 1)) return 0;
+    if (window == 0 && !obj_shows_in_margin(sx, sy, w, h)) return 0;
     *out_sy = sy;
     return 1;
 }
@@ -515,7 +598,13 @@ int extend_solid_edge(const std::uint8_t* r, int hx, int y, std::uint16_t* out) 
     const int ex = std::clamp(hx, 0, 239), ey = std::clamp(y, 0, 159);
     if (y < 0 || y >= 160) {
         std::uint16_t fill;
-        if (!covering_edge_row(r, vram, y, &fill)) return gba::kWsTilemapUnavailable;
+        if (!covering_edge_row(r, vram, y, &fill)) {
+            // A window against the edge continues past it (window_columns).
+            const std::int32_t e = hx >= 0 && hx < 240 ? window_entry(r, vram, hx, y) : -1;
+            if (e < 0) return gba::kWsTilemapUnavailable;
+            *out = static_cast<std::uint16_t>(e);
+            return gba::kWsTilemapReplace;
+        }
         if (hx >= 0 && hx < 240) {
             *out = fill;
             return gba::kWsTilemapReplace;
@@ -621,7 +710,9 @@ int provide(int bg, int hx, int y, std::uint16_t* out) {
     }
     // BG0 answers per side (and, above and below the screen, once for the rest).
     const int cell = bg == 0 ? (hx < 0 ? -1 : hx >= 240 ? -2 : -3) : (s_row.room_cx[bg] + hx) >> 4;
-    const int tile = bg == 0 ? 0 : (s_row.org_x[bg] + hx) >> 3;
+    // Above and below the screen BG0's native columns are answered per pixel:
+    // a window continues only under its own opaque edge pixels.
+    const int tile = bg == 0 ? (cell == -3 && (y < 0 || y >= 160) ? hx : 0) : (s_row.org_x[bg] + hx) >> 3;
     struct Memo {
         std::uint32_t frame = ~0u;
         std::uint32_t gen = 0;
