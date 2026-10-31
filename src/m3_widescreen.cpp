@@ -348,6 +348,29 @@ std::uint32_t bg0_entry_at(const std::uint8_t* r, int hx, int y);
 int bg0_color_at(const std::uint8_t* r, const std::uint8_t* vram, int hx, int y);
 bool covering_edge_row(const std::uint8_t* r, const std::uint8_t* vram, int y, std::uint16_t* fill);
 
+// Status windows against the bottom edge (the HP/PP boxes SELECT slides up,
+// at most 100 px wide each) are drawn g_margin_bottom rows lower, with their
+// interface sprites (place_obj_y): on the GBA they rest cut by the screen's
+// bottom edge and slide in from it, and so they do against the widened view's
+// bottom edge instead of stopping 10 rows short of it. The rows they leave
+// above show what is behind them. frame_start() finds them every frame.
+struct SlidingWindow { int left, right, top, offset; };
+SlidingWindow g_sliding[8];
+int g_sliding_count = 0;
+
+int slide_bg(int, int x, int y, int* source_x, int* source_y) {
+    for (int i = 0; i < g_sliding_count; ++i) {
+        const SlidingWindow& w = g_sliding[i];
+        if (!w.offset || x < w.left || x > w.right || y < w.top || y >= 160 + g_margin_bottom) continue;
+        const int from = y - w.offset;
+        if (from < w.top) return -1;
+        *source_x = x;
+        *source_y = from;
+        return 1;
+    }
+    return 0;
+}
+
 // Windows against the top or bottom edge (the HP/PP boxes SELECT slides up, a
 // menu) go on past it on the GBA, off screen, but the game draws only their
 // visible rows. Above and below the screen they continue from their own
@@ -444,6 +467,16 @@ int place_obj_y(int, std::uint16_t attr0, std::uint16_t attr1, std::uint16_t att
     if (!g_field_now || (!g_margin_top && !g_margin_bottom)) return 0;
     int sx, sy, w, h;
     if (!obj_box(attr0, attr1, &sx, &sy, &w, &h)) return 0;
+    // Interface sprites over a status window move down with it (g_sliding).
+    if (((attr2 >> 10) & 3) == 0) {
+        for (int i = 0; i < g_sliding_count; ++i) {
+            const SlidingWindow& box = g_sliding[i];
+            if (box.offset && sx + w > box.left && sx <= box.right && sy + h > box.top - 16 && sy < 160 + g_margin_bottom) {
+                *out_sy = sy + box.offset;
+                return 1;
+            }
+        }
+    }
     if (sy >= 0 && sy + h <= 160) return 0;  // within the native rows
     if (sy + h <= -g_margin_top || sy >= 160 + g_margin_bottom) return 0;  // in neither margin
     const int window = window_state(sx, w, sy < 0);
@@ -788,6 +821,31 @@ void frame_start() {
     g_battle_now = !g_field_now && r && battle_layout(r);
     gba::g_ws_pillarbox = g_field_now || g_battle_now ? 0 : 1;
     if (gba::GbaPpu* ppu = gbarecomp::active_ppu()) place_native_view(ppu);
+    g_sliding_count = 0;
+    gba::g_ws_bg_xy_provider = nullptr;
+    gba::GbaBus* bus = gbarecomp::active_bus();
+    if (!g_field_now || !r || !bus || !g_margin_bottom || !(io16(r, 0) & 0x100)) return;
+    const int cnt = io16(r, 0x08);
+    if ((cnt >> 14) != 0 || (cnt & 0x80)) return;
+    const std::uint8_t* vram = bus->vram_ptr();
+    for (int x = 0; x < 240 && g_sliding_count < 8;) {
+        if (!bg0_color_at(r, vram, x, 159)) { ++x; continue; }
+        const int left = x;
+        while (x < 240 && bg0_color_at(r, vram, x, 159)) ++x;
+        const int right = x - 1;
+        if (right - left < 23 || right - left > 100) continue;
+        // The window's top, scanning up its middle column.
+        int top = 159;
+        const int middle = (left + right) / 2;
+        while (top > 96 && bg0_color_at(r, vram, middle, top - 1)) --top;
+        g_sliding[g_sliding_count++] = {left, right, top, g_margin_bottom};
+    }
+    bool moving = false;
+    for (int i = 0; i < g_sliding_count; ++i) moving |= g_sliding[i].offset != 0;
+    if (moving) {
+        gba::g_ws_bg_xy_provider_layers = 1;
+        gba::g_ws_bg_xy_provider = &slide_bg;
+    }
 }
 
 // A layer is detached when its size or looping differs from the scenery's: a
