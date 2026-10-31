@@ -479,12 +479,14 @@ int place_obj_y(int, std::uint16_t attr0, std::uint16_t attr1, std::uint16_t att
     }
     if (sy >= 0 && sy + h <= 160) return 0;  // within the native rows
     if (sy + h <= -g_margin_top || sy >= 160 + g_margin_bottom) return 0;  // in neither margin
-    const int window = window_state(sx, w, sy < 0);
     // Interface sprites (OBJ priority 0: names and digits over BG0 windows)
     // show above and below the screen only over a window continuing there;
     // the game parks the hidden box's name just off screen (Y 161-163).
+    // People and objects follow the field rules whatever window is near:
+    // where a window covers them it does so by layer priority, as on the GBA.
     const bool interface = ((attr2 >> 10) & 3) == 0;
-    if (window == 2 || (interface && window != 1)) return 0;
+    const int window = interface ? window_state(sx, w, sy < 0) : 0;
+    if (interface && window != 1) return 0;
     if (window == 0 && !obj_shows_in_margin(sx, sy, w, h)) return 0;
     *out_sy = sy;
     return 1;
