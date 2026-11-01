@@ -1,13 +1,13 @@
 {
   "gbarecomp": {
     "url": "https://github.com/mstan/gbarecomp.git",
-    "revision": "b09d343a2598c4e214c056bf8aa81ec9f8face2a",
+    "revision": "c1a5fda36fb41c2fcba6c901692006ac69d50555",
     "patch": "patches/gbarecomp-runtime.patch",
-    "sha256": "2c96c67afdd62993d135ca4350b8707096d9b24f8ac61683427957d7e05e0504",
+    "sha256": "b13e8c5ec5722ff2b016ca42ce70ba279dd35b334f0e2cebcd4887b544a39ac5",
     "submodules": {
       "external/arm-recomp-core": {
         "url": "https://github.com/mstan/arm-recomp-core.git",
-        "revision": "451580e6a6164477a03a93c1e3818eca96a0a015"
+        "revision": "63dd32dd210a8bf18bbd11933393a7b87f9b3bf6"
       },
       "platform/android/third_party/SDL": {
         "url": "https://github.com/mstan/SDL.git",
